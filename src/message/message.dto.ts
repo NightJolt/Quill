@@ -11,7 +11,11 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+import { IdField } from '@/common/transformers/id-field.transformer';
+import { IsoDate } from '@/common/transformers/iso-date.transformer';
 import { AttachmentType } from './message.schema';
+
+// ── Requests ───────────────────────────────────────────────────────────────
 
 export class AttachmentDto {
   @IsEnum(AttachmentType)
@@ -48,12 +52,40 @@ export class SendMessageReq {
   attachments?: AttachmentDto[];
 }
 
-export interface MessageRes {
-  id: string;
-  roomId: string;
-  senderId: string;
-  content: string;
-  attachments?: AttachmentDto[];
-  linkPreviews?: { url: string; title?: string; description?: string; imageUrl?: string; siteName?: string }[];
-  createdAt: string;
+// ── Response sub-shapes ────────────────────────────────────────────────────
+
+export class AttachmentRes {
+  type!: AttachmentType;
+  @IdField()
+  fileId!: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  durationMs?: number;
+}
+
+export class LinkPreviewRes {
+  url!: string;
+  title?: string;
+  description?: string;
+  imageUrl?: string;
+  siteName?: string;
+}
+
+// ── Responses ──────────────────────────────────────────────────────────────
+
+export class MessageRes {
+  @IdField()
+  id!: string;
+  @IdField()
+  senderId!: string;
+  content!: string;
+
+  @Type(() => AttachmentRes)
+  attachments?: AttachmentRes[];
+
+  @Type(() => LinkPreviewRes)
+  linkPreviews?: LinkPreviewRes[];
+
+  @IsoDate()
+  createdAt!: string;
 }

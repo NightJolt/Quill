@@ -2,6 +2,7 @@ import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { Socket } from 'socket.io';
 import { AppRegistry } from './app-registry.service';
 import { verifySignature } from './signature';
+import { isObjectId } from '@/common/utils/object-id';
 
 /**
  * Authenticates a Socket.IO connection at the message-handler level (used as
@@ -42,8 +43,6 @@ export interface WsAuthResult {
   reason?: string;
 }
 
-const OBJECT_ID = /^[a-fA-F0-9]{24}$/;
-
 export function verifyWsHandshake(
   registry: AppRegistry,
   auth: WsHandshakeAuth,
@@ -52,13 +51,13 @@ export function verifyWsHandshake(
   if (!appId || !userId || !signature) {
     return { ok: false, reason: 'Missing appId/userId/signature' };
   }
-  if (!OBJECT_ID.test(userId)) {
+  if (!isObjectId(userId)) {
     // Quill requires 24-char hex userIds (mirrors the schema's ObjectId
     // typing). Rejecting at handshake stops downstream CastErrors before
     // they ever happen.
     return { ok: false, reason: 'userId must be a 24-char hex ObjectId' };
   }
-  if (!OBJECT_ID.test(appId)) {
+  if (!isObjectId(appId)) {
     return { ok: false, reason: 'appId must be a 24-char hex ObjectId' };
   }
   const key = registry.getKey(appId);

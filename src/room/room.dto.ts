@@ -1,45 +1,29 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsArray, IsMongoId, IsOptional, IsString, ArrayUnique, ArrayMaxSize } from 'class-validator';
+import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IdField } from '@/common/transformers/id-field.transformer';
+import { IsoDate } from '@/common/transformers/iso-date.transformer';
 
-export class CreateRoomReq {
-  @ApiProperty({
-    required: false,
-    description: 'Optional display name for the room.',
-    example: 'Apartment 304 — General',
-  })
+// ── Requests ───────────────────────────────────────────────────────────────
+
+/**
+ * Body for `PUT /internal/rooms/:roomId`. The room id comes from the URL —
+ * caller picks it (typically the consuming app's own resource id, e.g.
+ * `apartmentId` for urbancare). PUT is idempotent: existing rooms with the
+ * same `(appId, roomId)` are left alone (resurrected from soft delete if they
+ * were deleted, name overwritten if supplied).
+ */
+export class PutRoomReq {
   @IsOptional()
   @IsString()
+  @MaxLength(256)
   name?: string;
-
-  @ApiProperty({
-    description:
-      'Creator userId (24-char hex). Required — every room has a creator, even when minted server-side. Added to participants automatically.',
-    example: '507f1f77bcf86cd799439011',
-    pattern: '^[a-fA-F0-9]{24}$',
-  })
-  @IsMongoId()
-  createdBy!: string;
-
-  @ApiProperty({
-    required: false,
-    description:
-      'Initial participants (24-char hex userIds). Inserted in the same transaction as the room. `createdBy` is always included once, regardless of presence here.',
-    example: ['507f1f77bcf86cd799439011', '507f191e810c19729de860ea'],
-    maxItems: 500,
-    uniqueItems: true,
-  })
-  @IsOptional()
-  @IsArray()
-  @IsMongoId({ each: true })
-  @ArrayUnique()
-  @ArrayMaxSize(500)
-  initialParticipants?: string[];
 }
 
-export interface RoomRes {
-  id: string;
-  appId: string;
+// ── Responses ──────────────────────────────────────────────────────────────
+
+export class RoomRes {
+  @IdField()
+  id!: string;
   name?: string;
-  createdBy: string;
-  createdAt: string;
+  @IsoDate()
+  createdAt!: string;
 }

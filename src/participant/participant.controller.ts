@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, Param, Post, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { InternalKeyGuard } from '../auth/internal-key.guard';
 import { AppCtx } from '../auth/decorators';
 import type { AppContext } from '../auth/app-context';
@@ -18,8 +18,8 @@ import { AddParticipantsReq, ParticipantRes } from './participant.dto';
 export class ParticipantController {
   constructor(private readonly participants: ParticipantService) {}
 
+  /** Add users to a room (idempotent). */
   @Post()
-  @ApiOperation({ summary: 'Add users to a room (idempotent)' })
   add(
     @AppCtx() ctx: AppContext,
     @Param('roomId', ObjectIdPipe) roomId: string,
@@ -28,8 +28,8 @@ export class ParticipantController {
     return this.participants.addMany(ctx.appId, roomId, req.userIds);
   }
 
+  /** List participants of a room. */
   @Get()
-  @ApiOperation({ summary: 'List participants of a room' })
   list(
     @AppCtx() ctx: AppContext,
     @Param('roomId', ObjectIdPipe) roomId: string,
@@ -37,8 +37,8 @@ export class ParticipantController {
     return this.participants.listForRoom(ctx.appId, roomId);
   }
 
+  /** Remove a user from a room (idempotent). */
   @Delete(':userId')
-  @ApiOperation({ summary: 'Remove a user from a room (idempotent)' })
   async remove(
     @AppCtx() ctx: AppContext,
     @Param('roomId', ObjectIdPipe) roomId: string,

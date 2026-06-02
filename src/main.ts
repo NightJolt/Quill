@@ -1,5 +1,5 @@
-import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
+import { NestFactory, Reflector } from '@nestjs/core';
+import { ClassSerializerInterceptor, ValidationPipe } from '@nestjs/common';
 import { IoAdapter } from '@nestjs/platform-socket.io';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
@@ -19,6 +19,13 @@ async function bootstrap() {
   );
 
   app.useGlobalFilters(new ApiExceptionFilter());
+
+  // Serialize response DTOs via class-transformer decorators (@IdField,
+  // @IsoDate, @Type, @Expose, etc.). Replaces the per-service `toRes()`
+  // mappers that manually called `.toISOString()` / `.toString()` on every
+  // field — those collapse to `plainToInstance(MyRes, source)` because the
+  // class declarations now own the conversion rules.
+  app.useGlobalInterceptors(new ClassSerializerInterceptor(app.get(Reflector)));
 
   app.enableCors({
     origin: config.corsOrigins,
@@ -46,6 +53,26 @@ async function bootstrap() {
     .addBearerAuth(
       { type: 'http', scheme: 'bearer', description: 'App private key' },
       'appKey',
+    )
+    // Signature auth (user-facing REST): three discrete headers, validated
+    // together by SignatureGuard. Paste each into the matching field of
+    // Swagger's Authorize dialog.
+    .addApiKey(
+      { type: 'apiKey', in: 'header', name: 'X-Quill-App-Id', description: '24-char hex appId' },
+      'quill-app-id',
+    )
+    .addApiKey(
+      { type: 'apiKey', in: 'header', name: 'X-Quill-User-Id', description: '24-char hex userId' },
+      'quill-user-id',
+    )
+    .addApiKey(
+      {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-Quill-Signature',
+        description: 'HMAC-SHA256(userId, app_privateKey) as hex',
+      },
+      'quill-signature',
     )
     .build();
   const doc = SwaggerModule.createDocument(app, swaggerConfig);

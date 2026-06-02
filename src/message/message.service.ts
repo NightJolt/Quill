@@ -1,16 +1,16 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
-import { Message, MessageDocument } from './message.schema';
-import { ParticipantService } from '@/participant/participant.service';
+import { plainToInstance } from 'class-transformer';
+import { MessageRepository } from './message.repository';
+import { MessageDocument } from './message.schema';
+import { ParticipantRepository } from '@/participant/participant.repository';
 import { ApiException, ExcKey } from '@/common/exceptions/api.exception';
-import { AttachmentDto, MessageRes, SendMessageReq } from './message.dto';
+import { MessageRes, SendMessageReq } from './message.dto';
 
 @Injectable()
 export class MessageService {
   constructor(
-    @InjectModel(Message.name) private readonly messages: Model<Message>,
-    private readonly participants: ParticipantService,
+    private readonly repo: MessageRepository,
+    private readonly participants: ParticipantRepository,
   ) {}
 
   async send(
@@ -19,15 +19,8 @@ export class MessageService {
     senderId: string,
     req: SendMessageReq,
   ): Promise<MessageRes> {
-    const isParticipant = await this.participants.isParticipant(appId, roomId, senderId);
-    if (!isParticipant) {
-      throw new ApiException(
-        ExcKey.NOT_A_PARTICIPANT,
-        'You are not a participant of this room',
-        HttpStatus.FORBIDDEN,
-      );
-    }
-    const doc = await this.messages.create({
+    await this.assertParticipant(appId, roomId, senderId);
+    const doc = await this.repo.create({
       appId,
       roomId,
       senderId,
@@ -38,54 +31,76 @@ export class MessageService {
   }
 
   /**
-   * Paginate history backwards in time. `before` is exclusive — pass the
-   * `createdAt` of the oldest already-loaded message to fetch the next page.
-   * Capped at 100 per page; default 50.
+   * Paginate a room's history. Two directions, one per call:
+   *   - `beforeIso` (exclusive) → older messages, newest-first — scroll-up.
+   *   - `afterIso`  (exclusive) → newer messages, oldest-first — reconnect /
+   *     missed-message backfill.
+   * Pass the `createdAt` of your boundary message. Capped at 100; default 50.
+   *
+   * Owns input parsing (ISO string → Date) so callers (controller, future
+   * WS handler, future cron) all hit the same validation.
    */
   async history(
     appId: string,
     roomId: string,
     userId: string,
-    before: Date | undefined,
+    beforeIso: string | undefined,
+    afterIso: string | undefined,
     limit: number,
   ): Promise<MessageRes[]> {
-    const isParticipant = await this.participants.isParticipant(appId, roomId, userId);
-    if (!isParticipant) {
+    await this.assertParticipant(appId, roomId, userId);
+
+    if (beforeIso && afterIso) {
+      throw new ApiException(
+        ExcKey.UNHANDLED,
+        'pass only one of `before` or `after`',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const after = this.parseIso(afterIso, 'after');
+    if (after) {
+      const docs = await this.repo.findForward(appId, roomId, after, limit);
+      return docs.map((d) => this.toRes(d));
+    }
+
+    const before = this.parseIso(beforeIso, 'before');
+    const docs = await this.repo.findHistory(appId, roomId, before, limit);
+    return docs.map((d) => this.toRes(d));
+  }
+
+  private parseIso(iso: string | undefined, field: 'before' | 'after'): Date | undefined {
+    if (!iso) return undefined;
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) {
+      throw new ApiException(
+        ExcKey.UNHANDLED,
+        `\`${field}\` must be an ISO 8601 timestamp`,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    return d;
+  }
+
+  private async assertParticipant(appId: string, roomId: string, userId: string): Promise<void> {
+    const ok = await this.participants.exists(appId, roomId, userId);
+    if (!ok) {
       throw new ApiException(
         ExcKey.NOT_A_PARTICIPANT,
         'You are not a participant of this room',
         HttpStatus.FORBIDDEN,
       );
     }
-    const filter: Record<string, unknown> = { appId, roomId };
-    if (before) filter.createdAt = { $lt: before };
-    const docs = await this.messages.find(filter).sort({ createdAt: -1 }).limit(Math.min(limit, 100));
-    return docs.map((d) => this.toRes(d));
   }
 
   private toRes(doc: MessageDocument): MessageRes {
-    return {
+    return plainToInstance(MessageRes, {
       id: doc.id,
-      roomId: doc.roomId.toString(),
-      senderId: doc.senderId.toString(),
+      senderId: doc.senderId,
       content: doc.content,
-      attachments: doc.attachments?.map(
-        (a): AttachmentDto => ({
-          type: a.type,
-          fileId: a.fileId.toString(),
-          mimeType: a.mimeType,
-          sizeBytes: a.sizeBytes,
-          durationMs: a.durationMs,
-        }),
-      ),
-      linkPreviews: doc.linkPreviews?.map((lp) => ({
-        url: lp.url,
-        title: lp.title,
-        description: lp.description,
-        imageUrl: lp.imageUrl,
-        siteName: lp.siteName,
-      })),
-      createdAt: doc.createdAt.toISOString(),
-    };
+      attachments: doc.attachments,
+      linkPreviews: doc.linkPreviews,
+      createdAt: doc.createdAt,
+    });
   }
 }

@@ -1,19 +1,12 @@
-import { Body, Controller, Delete, Get, Param, Post, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { InternalKeyGuard } from '../auth/internal-key.guard';
-import { AppCtx } from '../auth/decorators';
-import type { AppContext } from '../auth/app-context';
-import { ObjectIdPipe } from '../common/pipes/object-id.pipe';
+import { Body, Controller, Delete, Get, Param, Put, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { InternalKeyGuard } from '@/auth/internal-key.guard';
+import { AppCtx } from '@/auth/decorators';
+import type { AppContext } from '@/auth/app-context';
+import { ObjectIdPipe } from '@/common/pipes/object-id.pipe';
 import { RoomService } from './room.service';
-import { CreateRoomReq, RoomRes } from './room.dto';
+import { PutRoomReq, RoomRes } from './room.dto';
 
-/**
- * Internal admin endpoints — called by app backends (urbancare monolith, etc.)
- * authenticated with their app's private key. Never exposed to end users.
- *
- * Routes do not include `appId` in the URL — it's derived from the credential
- * via InternalKeyGuard and injected with @AppCtx().
- */
 @ApiTags('Internal — Rooms')
 @ApiBearerAuth('appKey')
 @Controller('internal/rooms')
@@ -21,14 +14,22 @@ import { CreateRoomReq, RoomRes } from './room.dto';
 export class RoomController {
   constructor(private readonly rooms: RoomService) {}
 
-  @Post()
-  @ApiOperation({ summary: 'Create a room (with optional initial participants)' })
-  create(@AppCtx() ctx: AppContext, @Body() req: CreateRoomReq): Promise<RoomRes> {
-    return this.rooms.create(ctx.appId, req);
+  /**
+   * Idempotent upsert. Safe to call repeatedly for the same `roomId` —
+   * existing rows are left alone (resurrected if soft-deleted, name updated
+   * if supplied).
+   */
+  @Put(':roomId')
+  upsert(
+    @AppCtx() ctx: AppContext,
+    @Param('roomId', ObjectIdPipe) roomId: string,
+    @Body() req: PutRoomReq,
+  ): Promise<RoomRes> {
+    return this.rooms.upsert(ctx.appId, roomId, req);
   }
 
+  /** Get one room by id. */
   @Get(':roomId')
-  @ApiOperation({ summary: 'Get one room by id' })
   get(
     @AppCtx() ctx: AppContext,
     @Param('roomId', ObjectIdPipe) roomId: string,
@@ -36,8 +37,8 @@ export class RoomController {
     return this.rooms.getById(ctx.appId, roomId);
   }
 
+  /** Soft-delete a room. */
   @Delete(':roomId')
-  @ApiOperation({ summary: 'Soft-delete a room' })
   async delete(
     @AppCtx() ctx: AppContext,
     @Param('roomId', ObjectIdPipe) roomId: string,

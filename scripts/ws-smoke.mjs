@@ -55,18 +55,28 @@ const emitAck = (sock, event, payload) =>
   });
 
 async function main() {
-  console.log('--- Setup: create room with alice + bob ---');
-  const roomRes = await fetch(`${BASE}/internal/rooms`, {
-    method: 'POST',
+  console.log('--- Setup: PUT a caller-id room, add alice + bob ---');
+  // Caller picks the roomId (TalkJS-style). Use a fresh ObjectId so smoke
+  // runs don't collide with each other.
+  const roomId = oid();
+  const roomRes = await fetch(`${BASE}/internal/rooms/${roomId}`, {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${KEY}` },
-    body: JSON.stringify({ createdBy: ALICE, name: 'ws smoke', initialParticipants: [ALICE, BOB] }),
+    body: JSON.stringify({ name: 'ws smoke' }),
   });
   const room = await roomRes.json();
-  if (!room.id) {
-    console.error('Failed to create room:', room);
+  if (room.id !== roomId) {
+    console.error('Failed to upsert room:', room);
     process.exit(1);
   }
   console.log(`  room=${room.id}`);
+
+  // Seed participants via the participant endpoint.
+  await fetch(`${BASE}/internal/rooms/${room.id}/participants`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${KEY}` },
+    body: JSON.stringify({ userIds: [ALICE, BOB] }),
+  });
 
   console.log('\n--- Test 1: handshake with bad signature is rejected ---');
   try {

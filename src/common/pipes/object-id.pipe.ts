@@ -1,7 +1,6 @@
 import { ArgumentMetadata, HttpStatus, Injectable, PipeTransform } from '@nestjs/common';
 import { ApiException, ExcKey } from '../exceptions/api.exception';
-
-const OBJECT_ID = /^[a-fA-F0-9]{24}$/;
+import { isObjectId } from '../utils/object-id';
 
 /**
  * Param pipe that asserts a 24-char hex ObjectId. Use on `:roomId` /
@@ -13,7 +12,7 @@ const OBJECT_ID = /^[a-fA-F0-9]{24}$/;
 @Injectable()
 export class ObjectIdPipe implements PipeTransform<string, string> {
   transform(value: string, metadata: ArgumentMetadata): string {
-    if (!OBJECT_ID.test(value)) {
+    if (!isObjectId(value)) {
       throw new ApiException(
         ExcKey.UNHANDLED,
         `${metadata.data ?? 'parameter'} must be a 24-char hex ObjectId`,

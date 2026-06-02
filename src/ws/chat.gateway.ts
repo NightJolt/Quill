@@ -1,4 +1,4 @@
-import { Logger, UseGuards } from '@nestjs/common';
+import { Logger, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -33,6 +33,12 @@ import {
 @WebSocketGateway({
   cors: { origin: '*', credentials: true },
 })
+// Nest's `app.useGlobalPipes(...)` reliably wires HTTP routes but not WS
+// `@MessageBody()` parameters. Apply the same ValidationPipe explicitly so
+// the class-validator decorators on SubscribeReq / SendReq / TypingReq /
+// ReadReq actually run — without this, an authenticated client can send
+// arbitrarily-shaped payloads (e.g. 50MB `content`) and they'd persist.
+@UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }))
 export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
   private readonly logger = new Logger(ChatGateway.name);
 
@@ -119,7 +125,9 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       attachments: body.attachments,
     });
     const evt: MessageEvt = {
-      roomId: sent.roomId,
+      // body.roomId is the canonical routing key (MessageRes no longer
+      // carries it — the field is implicit at the REST/WS path level).
+      roomId: body.roomId,
       message: {
         id: sent.id,
         senderId: sent.senderId,
@@ -145,8 +153,9 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @UseGuards(WsSessionGuard)
   @SubscribeMessage(WsEvents.READ)
   async onRead(@WsUser() user: UserContext, @MessageBody() body: ReadReq): Promise<void> {
+    // `body.upTo` is already validated as an ISO 8601 string by the global
+    // ValidationPipe (see ReadReq's @IsDateString); just parse to Date here.
     const at = new Date(body.upTo);
-    if (Number.isNaN(at.getTime())) return;
     await this.participants.markRead(user.appId, body.roomId, user.userId, at);
     const evt: ReadEvt = { roomId: body.roomId, userId: user.userId, lastReadAt: at.toISOString() };
     this.server.to(roomChannel(user.appId, body.roomId)).emit(WsEvents.READ_EVT, evt);

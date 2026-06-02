@@ -1,15 +1,15 @@
-import { ApiProperty } from '@nestjs/swagger';
 import { IsString, Matches, MaxLength, MinLength } from 'class-validator';
+import { IdField } from '@/common/transformers/id-field.transformer';
+import { IsoDate } from '@/common/transformers/iso-date.transformer';
+
+// ── Requests ───────────────────────────────────────────────────────────────
 
 export class RegisterAppReq {
-  @ApiProperty({
-    description:
-      'Human-readable identifier — used in logs and admin UIs. Lowercase ascii letters / digits / dashes / underscores. Unique across all chat_apps rows.',
-    example: 'acme-coworking',
-    minLength: 2,
-    maxLength: 48,
-    pattern: '^[a-z0-9_-]+$',
-  })
+  /**
+   * Human-readable identifier — used in logs and admin UIs. Lowercase ascii
+   * letters / digits / dashes / underscores. Unique across all chat_apps
+   * rows.
+   */
   @IsString()
   @MinLength(2)
   @MaxLength(48)
@@ -19,22 +19,28 @@ export class RegisterAppReq {
   label!: string;
 }
 
-export interface AppRes {
-  appId: string;
-  label: string;
-  createdAt: string;
-  rotatedAt: string | null;
-  revoked: boolean;
+// ── Responses ──────────────────────────────────────────────────────────────
+
+export class AppRes {
+  @IdField()
+  appId!: string;
+  label!: string;
+  @IsoDate()
+  createdAt!: string;
+  @IsoDate()
+  rotatedAt!: string | null;
+  revoked!: boolean;
 }
 
-export interface RegisterAppRes {
-  appId: string;
-  label: string;
+export class RegisterAppRes {
+  @IdField()
+  appId!: string;
+  label!: string;
   /** Plaintext — shown ONCE. Capture and store immediately; cannot be retrieved later. */
-  privateKey: string;
+  privateKey!: string;
 }
 
-export interface RotateKeyRes {
+export class RotateKeyRes {
   /** New plaintext key — replace the value in the consuming app's backend env. */
-  privateKey: string;
+  privateKey!: string;
 }

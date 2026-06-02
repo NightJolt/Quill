@@ -1,50 +1,88 @@
+import {
+  ArrayMaxSize,
+  IsArray,
+  IsBoolean,
+  IsDateString,
+  IsMongoId,
+  IsOptional,
+  IsString,
+  MaxLength,
+  ValidateNested,
+} from 'class-validator';
+import { Type } from 'class-transformer';
+import { AttachmentDto } from '../message/message.dto';
+
 /**
- * Wire-level shapes for Socket.IO events. These types are the source of truth
- * for the WS protocol — keep frontend client types in sync by copying or
+ * Wire-level shapes for Socket.IO events. These are the source of truth for
+ * the WS protocol — keep frontend client types in sync by copying or
  * sharing this file.
  *
- * Convention:
- *   - Inbound (`*Req`) → events the client emits to the server
- *   - Outbound (`*Evt`) → events the server pushes to clients
- *   - Ack payloads documented inline where they exist
+ * Inbound classes carry `class-validator` decorators; the global
+ * `ValidationPipe` runs on every `@MessageBody()` argument, so untrusted
+ * client payloads can't get past the gateway with bogus shapes (huge
+ * content strings, wrong types, non-ObjectId roomIds).
+ *
+ * Conventions:
+ *   - `*Req` → inbound (client → server, validated)
+ *   - `*Evt` → outbound (server → client, no decorators needed; these are
+ *              just shape declarations for documentation)
  */
 
-// ---------- Inbound (client → server) ----------
+// ── Inbound (client → server) ──────────────────────────────────────────────
 
-export interface SubscribeReq {
-  roomId: string;
+export class SubscribeReq {
+  @IsMongoId()
+  roomId!: string;
 }
 
-export interface UnsubscribeReq {
-  roomId: string;
+export class UnsubscribeReq {
+  @IsMongoId()
+  roomId!: string;
 }
 
-export interface SendReq {
-  roomId: string;
-  content: string;
-  attachments?: {
-    type: 'image' | 'audio' | 'file';
-    fileId: string;
-    mimeType?: string;
-    sizeBytes?: number;
-    durationMs?: number;
-  }[];
+export class SendReq {
+  @IsMongoId()
+  roomId!: string;
+
+  @IsString()
+  @MaxLength(4000)
+  content!: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(10)
+  @ValidateNested({ each: true })
+  @Type(() => AttachmentDto)
+  attachments?: AttachmentDto[];
+
   /** Opaque id chosen by the client so it can reconcile optimistic UI when the ack comes back. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
   clientTempId?: string;
 }
 
-export interface TypingReq {
-  roomId: string;
-  isTyping: boolean;
+export class TypingReq {
+  @IsMongoId()
+  roomId!: string;
+
+  @IsBoolean()
+  isTyping!: boolean;
 }
 
-export interface ReadReq {
-  roomId: string;
+export class ReadReq {
+  @IsMongoId()
+  roomId!: string;
+
   /** The createdAt of the most recent message the user has seen. */
-  upTo: string;
+  @IsDateString()
+  upTo!: string;
 }
 
-// ---------- Outbound (server → client) ----------
+// ── Outbound (server → client) ─────────────────────────────────────────────
+// Plain interfaces — no validation needed on outbound payloads. The server
+// builds these from trusted state. They exist for documentation + to give
+// the gateway code something to type-check against.
 
 export interface MessageEvt {
   roomId: string;
@@ -71,7 +109,7 @@ export interface ReadEvt {
   lastReadAt: string;
 }
 
-// ---------- Event name constants ----------
+// ── Event name constants ───────────────────────────────────────────────────
 
 export const WsEvents = {
   // inbound

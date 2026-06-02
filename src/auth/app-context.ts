@@ -19,5 +19,6 @@ export interface UserContext {
 declare module 'express' {
   interface Request {
     appContext?: AppContext;
+    userContext?: UserContext;
   }
 }

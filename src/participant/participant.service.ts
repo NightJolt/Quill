@@ -1,99 +1,56 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Model, Types } from 'mongoose';
-import { Participant, ParticipantDocument } from './participant.schema';
-import { Room } from '../room/room.schema';
+import { plainToInstance } from 'class-transformer';
+import { ParticipantRepository } from './participant.repository';
+import { ParticipantDocument } from './participant.schema';
+import { RoomRepository } from '../room/room.repository';
 import { ApiException, ExcKey } from '../common/exceptions/api.exception';
 import { ParticipantRes } from './participant.dto';
 
 @Injectable()
 export class ParticipantService {
   constructor(
-    @InjectModel(Participant.name) private readonly participants: Model<Participant>,
-    @InjectModel(Room.name) private readonly rooms: Model<Room>,
+    private readonly repo: ParticipantRepository,
+    private readonly rooms: RoomRepository,
   ) {}
 
-  /**
-   * Idempotent — adding a userId that's already a participant is a no-op
-   * (the unique-index conflict is swallowed via `ordered: false`). Returns
-   * the participant rows for everyone in the input list, whether newly added
-   * or pre-existing.
-   */
   async addMany(appId: string, roomId: string, userIds: string[]): Promise<ParticipantRes[]> {
     await this.assertRoomExists(appId, roomId);
-    const rows = userIds.map((userId) => ({ appId, roomId, userId, lastReadAt: null }));
-    try {
-      await this.participants.insertMany(rows, { ordered: false });
-    } catch (e: unknown) {
-      // Bulk insert with duplicates: ignore unique-key violations (code 11000), rethrow others.
-      if (!isDuplicateKeyBulkError(e)) {
-        throw e;
-      }
-    }
-    const docs = await this.participants.find({ appId, roomId, userId: { $in: userIds } });
+    const docs = await this.repo.addMany(appId, roomId, userIds);
     return docs.map((d) => this.toRes(d));
   }
 
   async remove(appId: string, roomId: string, userId: string): Promise<void> {
     await this.assertRoomExists(appId, roomId);
-    await this.participants.deleteOne({ appId, roomId, userId });
-    // Removing a non-participant is a no-op — idempotent for retry safety.
+    await this.repo.remove(appId, roomId, userId);
   }
 
   async listForRoom(appId: string, roomId: string): Promise<ParticipantRes[]> {
     await this.assertRoomExists(appId, roomId);
-    const docs = await this.participants.find({ appId, roomId });
+    const docs = await this.repo.findByRoom(appId, roomId);
     return docs.map((d) => this.toRes(d));
   }
 
-  async listRoomIdsForUser(appId: string, userId: string): Promise<string[]> {
-    const docs = await this.participants
-      .find({ appId, userId }, { roomId: 1 })
-      .lean<{ roomId: Types.ObjectId }[]>();
-    return docs.map((d) => d.roomId.toString());
+  isParticipant(appId: string, roomId: string, userId: string): Promise<boolean> {
+    return this.repo.exists(appId, roomId, userId);
   }
 
-  async isParticipant(appId: string, roomId: string, userId: string): Promise<boolean> {
-    const count = await this.participants.countDocuments({ appId, roomId, userId });
-    return count > 0;
-  }
-
-  async markRead(appId: string, roomId: string, userId: string, at: Date): Promise<void> {
-    await this.participants.updateOne(
-      { appId, roomId, userId },
-      { $set: { lastReadAt: at } },
-    );
+  markRead(appId: string, roomId: string, userId: string, at: Date): Promise<void> {
+    return this.repo.markRead(appId, roomId, userId, at);
   }
 
   private async assertRoomExists(appId: string, roomId: string): Promise<void> {
-    const exists = await this.rooms.exists({ _id: roomId, appId, deleted: false });
+    const exists = await this.rooms.existsActive(appId, roomId);
     if (!exists) {
       throw new ApiException(ExcKey.ROOM_NOT_FOUND, 'Room not found', HttpStatus.NOT_FOUND);
     }
   }
 
   private toRes(doc: ParticipantDocument): ParticipantRes {
-    return {
-      appId: doc.appId.toString(),
-      roomId: doc.roomId.toString(),
-      userId: doc.userId.toString(),
-      joinedAt: doc.joinedAt.toISOString(),
-      lastReadAt: doc.lastReadAt ? doc.lastReadAt.toISOString() : null,
-    };
+    // appId + roomId are implicit (caller's credential + URL path).
+    return plainToInstance(ParticipantRes, {
+      userId: doc.userId,
+      joinedAt: doc.joinedAt,
+      lastReadAt: doc.lastReadAt,
+    });
   }
-}
-
-interface MongoBulkWriteError {
-  writeErrors?: { code?: number }[];
-  code?: number;
-}
-
-function isDuplicateKeyBulkError(e: unknown): boolean {
-  if (typeof e !== 'object' || e === null) return false;
-  const err = e as MongoBulkWriteError;
-  if (err.code === 11000) return true;
-  if (Array.isArray(err.writeErrors)) {
-    return err.writeErrors.every((w) => w.code === 11000);
-  }
-  return false;
 }

@@ -30,3 +30,17 @@ export const WsUser = createParamDecorator((_data: unknown, ctx: ExecutionContex
   }
   return { appId, userId };
 });
+
+/**
+ * Injects the `UserContext` attached by SignatureGuard on user-facing REST
+ * endpoints.
+ *
+ *   @Get(...) history(@UserCtx() user: UserContext, ...) { ... }
+ */
+export const UserCtx = createParamDecorator((_data: unknown, ctx: ExecutionContext): UserContext => {
+  const req = ctx.switchToHttp().getRequest<Request>();
+  if (!req.userContext) {
+    throw new Error('UserContext missing — is SignatureGuard applied to this route?');
+  }
+  return req.userContext;
+});

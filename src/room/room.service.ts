@@ -1,77 +1,40 @@
 import { HttpStatus, Injectable } from '@nestjs/common';
-import { InjectModel } from '@nestjs/mongoose';
-import { Connection, Model } from 'mongoose';
-import { InjectConnection } from '@nestjs/mongoose';
-import { Room, RoomDocument } from './room.schema';
-import { Participant } from '../participant/participant.schema';
+import { plainToInstance } from 'class-transformer';
+import { RoomRepository } from './room.repository';
+import { RoomDocument } from './room.schema';
 import { ApiException, ExcKey } from '../common/exceptions/api.exception';
-import { CreateRoomReq, RoomRes } from './room.dto';
+import { PutRoomReq, RoomRes } from './room.dto';
 
 @Injectable()
 export class RoomService {
-  constructor(
-    @InjectModel(Room.name) private readonly rooms: Model<Room>,
-    @InjectModel(Participant.name) private readonly participants: Model<Participant>,
-    @InjectConnection() private readonly connection: Connection,
-  ) {}
+  constructor(private readonly repo: RoomRepository) {}
 
-  /**
-   * Create a room scoped to `appId` and seed it with the creator + any
-   * initialParticipants. The set is deduped — `createdBy` is always included
-   * exactly once. All writes happen in a single Mongo session for atomicity.
-   */
-  async create(appId: string, req: CreateRoomReq): Promise<RoomRes> {
-    const participantIds = new Set<string>([req.createdBy, ...(req.initialParticipants ?? [])]);
-    const session = await this.connection.startSession();
-    try {
-      let room!: RoomDocument;
-      await session.withTransaction(async () => {
-        const [created] = await this.rooms.create(
-          [{ appId, name: req.name, createdBy: req.createdBy }],
-          { session },
-        );
-        room = created;
-        const rows = [...participantIds].map((userId) => ({
-          appId,
-          roomId: room.id,
-          userId,
-          lastReadAt: null,
-        }));
-        if (rows.length > 0) {
-          await this.participants.insertMany(rows, { session });
-        }
-      });
-      return this.toRes(room);
-    } finally {
-      await session.endSession();
-    }
+  async upsert(appId: string, roomId: string, req: PutRoomReq): Promise<RoomRes> {
+    const doc = await this.repo.upsert(appId, roomId, req.name);
+    return this.toRes(doc);
   }
 
-  async getById(appId: string, id: string): Promise<RoomRes> {
-    const room = await this.rooms.findOne({ _id: id, appId, deleted: false });
-    if (!room) {
+  async getById(appId: string, roomId: string): Promise<RoomRes> {
+    const doc = await this.repo.findActive(appId, roomId);
+    if (!doc) {
       throw new ApiException(ExcKey.ROOM_NOT_FOUND, 'Room not found', HttpStatus.NOT_FOUND);
     }
-    return this.toRes(room);
+    return this.toRes(doc);
   }
 
-  async softDelete(appId: string, id: string): Promise<void> {
-    const result = await this.rooms.updateOne(
-      { _id: id, appId, deleted: false },
-      { $set: { deleted: true } },
-    );
-    if (result.matchedCount === 0) {
+  async softDelete(appId: string, roomId: string): Promise<void> {
+    const ok = await this.repo.softDelete(appId, roomId);
+    if (!ok) {
       throw new ApiException(ExcKey.ROOM_NOT_FOUND, 'Room not found', HttpStatus.NOT_FOUND);
     }
   }
 
   private toRes(doc: RoomDocument): RoomRes {
-    return {
-      id: doc.id,
-      appId: doc.appId.toString(),
+    return plainToInstance(RoomRes, {
+      // The external id the caller supplied — NOT the internal `_id` surrogate.
+      id: doc.roomId,
       name: doc.name,
-      createdBy: doc.createdBy.toString(),
-      createdAt: doc.createdAt.toISOString(),
-    };
+      createdAt: doc.createdAt,
+    });
   }
 }

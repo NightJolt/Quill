@@ -239,13 +239,16 @@ All collections share a Mongo cluster with urbancare_monolith but use distinct c
 
 ```typescript
 {
-  _id: ObjectId,
-  appId: string,           // indexed
+  _id: ObjectId,           // Quill-internal surrogate (auto-generated)
+  appId: ObjectId,
+  roomId: ObjectId,        // caller-supplied external id (e.g. apartmentId)
   name?: string,           // optional display label, app-specific
+  deleted: boolean,        // soft-delete flag
   createdAt: Date,
-  createdBy: string,       // userId of creator, scoped to appId
 }
 ```
+
+Compound unique index `(appId, roomId)` — that pair, **not `_id`**, is the room's identity. `roomId` is the id the consuming app supplies (urbancare passes `apartmentId`); `_id` is an internal surrogate Quill generates. This keeps tenants isolated: two apps may use the same `roomId` and the `(appId, roomId)` index keys them apart. Participants and messages reference the external `roomId` (scoped by `appId`), never `_id`, so there's no internal-id lookup. The API echoes `roomId` back as `RoomRes.id` — callers always see the id they supplied.
 
 ### `chat_participants`
 
@@ -334,11 +337,13 @@ At the API boundary everything is still strings — DTOs validate via `@IsMongoI
 WebSocket: wss://quill.example.com/  (Socket.IO endpoint)
   Handshake auth: { appId, userId, signature }
 
-REST (if any user-facing REST endpoint is needed beyond what WS provides):
-  GET    /rooms                                  # auto-scoped to session.appId
-  GET    /rooms/{id}/messages?before=&limit=
-  POST   /rooms/{id}/messages
-  POST   /rooms/{id}/read
+REST (implemented today — signature headers X-Quill-App-Id / X-Quill-User-Id / X-Quill-Signature):
+  GET    /rooms/{id}/messages?before=|after=&limit=   # history; one direction per call, both exclusive, max 100
+
+REST (sketched, NOT implemented — WS covers these today):
+  GET    /rooms                                  # list a user's rooms
+  POST   /rooms/{id}/messages                    # send over REST
+  POST   /rooms/{id}/read                        # mark-read over REST
 ```
 
 Default expectation: **user-facing REST is minimal or zero**. Frontend can do everything over Socket.IO (rooms list, history pagination, send, mark-read). REST is a fallback for cases where WS isn't connected (server-rendered initial state, missed-message backfill).
@@ -364,8 +369,8 @@ Routes never put `appId` in the URL — it's always derived from the credential.
 ```
 send         { roomId, content, attachments?, clientTempId } → ack: { messageId, createdAt }
 typing       { roomId, isTyping: boolean }
-read         { roomId, messageId } → updates lastReadAt
-subscribe    { roomId } → joins Socket.IO room "room:{roomId}", server checks participation
+read         { roomId, upTo: <ISO8601 timestamp> } → updates participant lastReadAt
+subscribe    { roomId } → joins Socket.IO room "room:{appId}:{roomId}", server checks participation
 unsubscribe  { roomId }
 ```
 
@@ -375,18 +380,23 @@ The server validates that the connecting userId is a participant of any room the
 
 ```
 message         { roomId, message: {...} }
-message_update  { roomId, messageId, linkPreviews? | editedAt? }   # for async link preview hydration
 typing          { roomId, userId, isTyping }
 read            { roomId, userId, lastReadAt }
-participant_add { roomId, userId }
-participant_remove { roomId, userId }
+```
+
+**Implemented today:** `message`, `typing`, `read` (see `ws-events.ts` — the source of truth the frontend copies). The following are **specified but NOT yet emitted** by `chat.gateway.ts` — do not build the frontend against them until they ship:
+
+```
+participant_add    { roomId, userId }     # NOT IMPLEMENTED — see backlog quill-5
+participant_remove { roomId, userId }     # NOT IMPLEMENTED — see backlog quill-5
+message_update     { roomId, messageId, linkPreviews? | editedAt? }   # NOT IMPLEMENTED — async link-preview / edit hydration, deferred
 ```
 
 ### Acks and retries
 
 - `send` returns ack `{ messageId, createdAt }`. Client uses `clientTempId` to reconcile optimistic UI.
-- Default Socket.IO ack timeout: 10s. Client retries on timeout.
-- On reconnect: client requests `GET /rooms/{id}/messages?since=<lastMessageCreatedAt>` to backfill.
+- Default Socket.IO ack timeout: 10s. Client retries on timeout. (NOTE: server-side dedup on `clientTempId` is not yet implemented — see backlog quill-3; a retry currently creates a duplicate row.)
+- On reconnect: client requests `GET /rooms/{id}/messages?after=<createdAt of last received message>` to backfill forward (oldest-first). Scroll-up uses `?before=<createdAt of oldest loaded>` (newest-first). Both bounds exclusive; pass only one per call.
 
 ---
 
@@ -578,6 +588,41 @@ quill/
 Follow Nest's standard `kebab-case` for filenames, `PascalCase` for classes. **Modules by domain** (room, participant, message, ws, auth) — not by role like the monolith. NestJS doesn't have urbancare_monolith's `{Module}{Role}Service.kt` convention; module-per-domain is the Nest idiom.
 
 The `room/`, `participant/`, `message/` boundary is intentional — although they share a "chat" concept, they have distinct lifecycles (rooms created independently, participants added/removed independently, messages constantly flowing). Co-locating them under `chat/` is fine if it grows unwieldy; start modular.
+
+---
+
+## Known gaps & hardening backlog
+
+Findings from a TalkJS-vs-Quill architecture review (2026-05). Tackle gradually — ordered by priority. Each item names the real problem, the concrete fix (corrected against the actual code), and the files. Items marked **rejected** were considered and deliberately declined; **skip** items are recorded so the omission is a decision, not an oversight.
+
+> Context on the verdict: Quill's big bets are sound — it copied the parts of TalkJS that scale (`lastReadAt` watermark over per-message `readBy`; caller-supplied room IDs; no profile storage; notifications delegated to the app via callback) and dropped the parts that don't. The gaps below are mostly correctness/security seams in the message-delivery path, plus doc-vs-code drift that would inject bugs into the frontend build.
+
+### Now — message-delivery correctness/security (cheap before the frontend ships)
+
+- [ ] **Reject empty messages.** `content` is `@IsString() @MaxLength(4000)` with no minimum and the schema defaults it to `''`, so `{content:''}` with no attachments persists a junk row and broadcasts an empty bubble to the whole apartment. Fix in the single choke point both WS and REST funnel through — `MessageService.send()` (`src/message/message.service.ts`): trim `content`, reject when trimmed length is 0 **AND** no attachments (throw `ApiException(ExcKey.EMPTY_MESSAGE, …, 400)`), and persist the trimmed value. Do **not** put `@MinLength(1)` on `content` alone — it would wrongly reject valid attachment-only messages. (`message.dto.ts`, `ws/ws-events.ts` may carry an optional fast-fail validator, but the service is the source of truth.)
+- [x] **Forward (`after=`) history pagination so reconnect backfill works.** *(Done 2026-06.)* `findForward()` in `message.repository.ts` (`createdAt: {$gt}`, sort asc, cap 100); `MessageService.history` accepts `after`, shares an ISO parser with `before`, rejects both supplied (400); `after` query param wired in the controller. The `(createdAt,_id)` tuple-cursor tie-break is deferred as noted.
+- [ ] **Force-unsubscribe removed users + emit roster events.** `onSubscribe` checks participation only at subscribe-time; `ParticipantService.remove()` deletes the row but never kicks the socket, so a removed resident keeps receiving live broadcasts until they disconnect (authorization seam). In `remove()`, after the DB delete, loop **every** socket from `ConnectionRegistry.socketsFor(appId,userId)` (multiple tabs/devices) and `socket.leave(roomChannel(appId,roomId))` — this is the load-bearing fix and must run unconditionally. Then emit the spec'd `participant_add`/`participant_remove` to the room channel. **Wiring:** publish via a small leaf `RoomBroadcaster` (or Nest `EventEmitter2`) that `ParticipantService` writes and the gateway consumes — do **not** inject the Socket.IO `Server` into `ParticipantService` (`WsModule` already imports `ParticipantModule`; inverting it risks a circular dep). Single-instance only; `socket.leave` is process-local — revisit with the deferred Redis adapter.
+
+### Soon
+
+- [ ] **Dedup sends on `clientTempId`.** CLAUDE.md tells clients to retry on the 10s ack timeout, but nothing dedups → a write that lands after timeout creates a duplicate broadcast. `clientTempId` is echoed for optimistic UI but never persisted. Make `(appId, roomId, senderId, clientTempId)` an idempotency key: a **partial** unique index (`partialFilterExpression: { clientTempId: { $exists: true } }` — not sparse, and **no TTL** — a Mongo TTL deletes the whole message doc), plumb `clientTempId` through `send()` + `repo.create()`, then catch `isDuplicateKeyError` (helper in `common/utils/mongo-errors.ts`) and re-query to return the original. Sends that omit `clientTempId` are excluded from the index and behave as today.
+- [ ] **Build the `PushService` callback stub + pin reverse-auth** (resolves open-question #2). Fire-and-forget in `ChatGateway.onSend` **after** the broadcast emit (not in `MessageService.send()`, which future REST sends reuse and which owns no broadcast); never block the ack. Recipients = room participants − sender − `ConnectionRegistry.hasActive()`; throttle 1/(appId,userId,roomId)/10s (in-memory Map, single-instance). Contract: `POST {callbackUrl} { userId, roomId, message }` with `X-Quill-Signature = HMAC-SHA256(rawBody, appPrivateKey)` (reuse the user-sig crypto primitive, zero new secrets; monolith verifies over the raw bytes). Add an optional `callbackUrl` to `chat_apps` **and** a `PATCH /admin/apps/:appId { callbackUrl }` to set it (else the field is dead). Decide replay protection explicitly (body-only signing matches Quill's no-expiry philosophy; add a timestamp only if needed — note: the `timestamp + "." + body` scheme is *Stripe's*, not TalkJS's).
+- [x] **Reconcile the WS protocol doc with shipped code** *(Done 2026-06.)* `read` now documented as `{roomId, upTo: ISO}` (watermark); reconnect documented as `?after=` (forward) / `?before=` (scroll-up); `participant_add`/`participant_remove`/`message_update` flagged NOT IMPLEMENTED in the Server→client section so the frontend doesn't build against them.
+
+### Later — cheap internal hardening
+
+- [ ] **`room.upsert` race → typed exception.** `RoomRepository.upsert` (`src/room/room.repository.ts`) throws a raw `Error('…disappeared after upsert')` if a DELETE races it, surfacing to the monolith Feign caller as an opaque 500 `UNHANDLED`. Add `ExcKey.CONFLICT` and throw `ApiException(ExcKey.CONFLICT, …, 409)` — **not** `ROOM_NOT_FOUND`/404 (the upsert *succeeded*, then raced). Skip the "retry once" — the path is effectively unreachable in the apartment-room-creation flow.
+- [ ] **Format-validate the signature header to 64 hex** before comparison, for input-validation consistency with the appId/userId ObjectId checks (lets you drop the `try/catch` around `Buffer.from` in `signature.ts`). Add a shared `SIGNATURE_REGEX = /^[0-9a-f]{64}$/` next to `OBJECT_ID_REGEX`; reject in `SignatureGuard` + `verifyWsHandshake`. Note: frame this as validation hygiene, **not** as closing a timing oracle — the length compare leaks only "is it 64 chars," which the attacker already knows; the real compare is already `timingSafeEqual`. Handshake rate-limiting stays deferred (open-question #5).
+- [ ] **Index `chat_rooms` on `(appId, deleted)`** (`room.schema.ts`, same explicit style as `MessageSchema.index`). Point lookups are fine today; this is forward-looking for a future "list active rooms for app" query. (No participant index needed — `findByRoom(appId,roomId)` is already served as a prefix of the unique `(appId,roomId,userId)` index.)
+
+### Rejected (considered, declined)
+
+- **Pluggable `verifyCredential` seam for future JWT** — YAGNI. Only two call sites (`signature.guard.ts`, `ws-session.guard.ts`), already adjacent; the client contract lives in the monolith + frontend, which a Quill-internal seam never touches. If JWT is ever needed it's a ~4-line local refactor then. (Non-expiring HMAC is a deliberate, documented choice — see "Signature format".)
+- **Add a per-participant `notify`/mute column now, defer the UI** — on Mongo an optional field with a default applies on read with zero backfill/downtime, so there's no migration cost to pre-empt. Adding it ahead of its only consumer (`PushService`) is a speculative dead field. Add `notify` *in the same change* that builds the push selection rule that reads it.
+
+### Skip (correct anti-goals; revisit only if a second consuming app demands them)
+
+Per-message `readBy` (TalkJS's own ~≤300-participant cap is the evidence this is the wrong call for apartment-wide rooms), emoji reactions, threaded replies, message edit/delete, message search, presence service. Nothing in the schema paints these into a corner — `replyToId`/`editedAt`/`deleted` are reserved as v2 fields, and presence is derivable from `ConnectionRegistry`.
 
 ---
 

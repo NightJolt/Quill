@@ -20,7 +20,7 @@ await mongoose.connect(env.MONGO_URI);
 const db = mongoose.connection.db;
 
 const cases = [
-  { coll: 'chat_rooms', fields: ['appId', 'createdBy'] },
+  { coll: 'chat_rooms', fields: ['appId'] },
   { coll: 'chat_participants', fields: ['appId', 'roomId', 'userId'] },
   { coll: 'chat_messages', fields: ['appId', 'roomId', 'senderId'] },
 ];
