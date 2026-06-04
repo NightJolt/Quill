@@ -15,7 +15,11 @@ export type AttachmentType = (typeof AttachmentType)[keyof typeof AttachmentType
  */
 @Schema({ _id: false })
 export class Attachment {
-  @Prop({ required: true, enum: Object.values(AttachmentType) })
+  // Explicit `type: String` — Mongoose infers the field type from reflect
+  // metadata, and a string-literal union (`'image'|'audio'|'file'`) only
+  // collapses to String under tsc; esbuild/tsx emit `Object` and Mongoose
+  // throws CannotDetermineTypeError. Naming it keeps the schema loader-agnostic.
+  @Prop({ required: true, type: String, enum: Object.values(AttachmentType) })
   type!: AttachmentType;
 
   @Prop({ required: true, type: MongooseSchema.Types.ObjectId })
@@ -78,6 +82,14 @@ export class Message {
 
   @Prop({ type: [LinkPreviewSchema], default: undefined })
   linkPreviews?: LinkPreview[];
+
+  /**
+   * Opaque, app-defined JSON. Quill never reads or interprets it — the calling
+   * app owns the shape (urbancare uses it to carry chat media file ids). Stored
+   * as Mixed; size is capped at the service layer.
+   */
+  @Prop({ type: MongooseSchema.Types.Mixed })
+  metadata?: Record<string, unknown>;
 
   /** Set when the sender edits the message; absent on never-edited messages. */
   @Prop({ type: Date })

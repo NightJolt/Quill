@@ -23,14 +23,28 @@ export class MessageService {
     req: SendMessageReq,
   ): Promise<MessageRes> {
     await this.assertParticipant(appId, roomId, senderId);
+    this.assertMetadataSize(req.metadata);
     const doc = await this.repo.create({
       appId,
       roomId,
       senderId,
       content: req.content,
       attachments: req.attachments,
+      metadata: req.metadata,
     });
     return this.toRes(doc);
+  }
+
+  /** Reject oversized opaque metadata — a generous cap for ids/small structs. */
+  private assertMetadataSize(metadata: Record<string, unknown> | undefined): void {
+    if (!metadata) return;
+    if (JSON.stringify(metadata).length > 16_384) {
+      throw new ApiException(
+        ExcKey.UNHANDLED,
+        'metadata exceeds the 16KB limit',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
   }
 
   /**
@@ -84,15 +98,21 @@ export class MessageService {
    * must be the original sender. Clears content/attachments so the deleted text
    * doesn't linger server-side, then broadcasts `message_deleted`. Idempotent.
    */
+  /**
+   * Soft-delete a message. Returns the message's `metadata` as it was *before*
+   * tombstoning, so the caller (the app backend) can release any resources it
+   * referenced — e.g. urbancare uncommits the media file ids. Quill itself
+   * never interprets the metadata.
+   */
   async remove(
     appId: string,
     roomId: string,
     messageId: string,
     actorId: string,
     allowAnySender: boolean,
-  ): Promise<void> {
+  ): Promise<{ metadata?: Record<string, unknown> }> {
     const doc = await this.loadOrThrow(appId, roomId, messageId);
-    if (doc.deleted) return; // already a tombstone — idempotent
+    if (doc.deleted) return {}; // already a tombstone — idempotent, nothing to release
     if (!allowAnySender && doc.senderId.toString() !== actorId) {
       throw new ApiException(
         ExcKey.FORBIDDEN,
@@ -100,14 +120,17 @@ export class MessageService {
         HttpStatus.FORBIDDEN,
       );
     }
+    const metadata = doc.metadata; // capture before clearing
     doc.deleted = true;
     doc.deletedAt = new Date();
     doc.content = '';
     doc.attachments = undefined;
     doc.linkPreviews = undefined;
+    doc.set('metadata', undefined); // drop media/file refs from the tombstone
     await this.repo.save(doc);
 
     this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_DELETE, { roomId, messageId });
+    return { metadata };
   }
 
   /**
@@ -218,6 +241,7 @@ export class MessageService {
       content: doc.content,
       attachments: obj.attachments,
       linkPreviews: obj.linkPreviews,
+      metadata: obj.metadata,
       createdAt: doc.createdAt,
       // Omit when absent/false so the wire stays clean for the common case.
       editedAt: doc.editedAt ? doc.editedAt.toISOString() : undefined,

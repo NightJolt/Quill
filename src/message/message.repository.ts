@@ -26,6 +26,7 @@ export class MessageRepository {
       sizeBytes?: number;
       durationMs?: number;
     }>;
+    metadata?: Record<string, unknown>;
   }): Promise<MessageDocument> {
     return this.messages.create(args);
   }

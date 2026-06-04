@@ -4,6 +4,7 @@ import {
   IsBoolean,
   IsDateString,
   IsMongoId,
+  IsObject,
   IsOptional,
   IsString,
   MaxLength,
@@ -55,6 +56,11 @@ export class SendReq {
   @Type(() => AttachmentDto)
   attachments?: AttachmentDto[];
 
+  /** Opaque app-defined JSON (size-capped in the service). */
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
+
   /** Opaque id chosen by the client so it can reconcile optimistic UI when the ack comes back. */
   @IsOptional()
   @IsString()
@@ -91,6 +97,7 @@ export interface MessageEvt {
     senderId: string;
     content: string;
     attachments?: SendReq['attachments'];
+    metadata?: Record<string, unknown>;
     createdAt: string;
   };
   /** Echoed from SendReq for optimistic-reconciliation by the sender. */
@@ -105,6 +112,7 @@ export interface MessageUpdateEvt {
     senderId: string;
     content: string;
     attachments?: SendReq['attachments'];
+    metadata?: Record<string, unknown>;
     createdAt: string;
     editedAt?: string;
   };

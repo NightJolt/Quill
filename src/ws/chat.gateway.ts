@@ -130,6 +130,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     const sent = await this.messages.send(user.appId, body.roomId, user.userId, {
       content: body.content,
       attachments: body.attachments,
+      metadata: body.metadata,
     });
     const evt: MessageEvt = {
       // body.roomId is the canonical routing key (MessageRes no longer
@@ -140,6 +141,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         senderId: sent.senderId,
         content: sent.content,
         attachments: sent.attachments,
+        metadata: sent.metadata,
         createdAt: sent.createdAt,
       },
       clientTempId: body.clientTempId,

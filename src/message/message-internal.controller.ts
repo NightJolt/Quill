@@ -63,8 +63,16 @@ export class MessageInternalController {
     @Param('messageId', ObjectIdPipe) messageId: string,
     @Query('actorId', ObjectIdPipe) actorId: string,
     @Query('allowAnySender', new DefaultValuePipe(false), ParseBoolPipe) allowAnySender: boolean,
-  ): Promise<{ success: true }> {
-    await this.messages.remove(ctx.appId, roomId, messageId, actorId, allowAnySender);
-    return { success: true };
+  ): Promise<{ success: true; metadata?: Record<string, unknown> }> {
+    const { metadata } = await this.messages.remove(
+      ctx.appId,
+      roomId,
+      messageId,
+      actorId,
+      allowAnySender,
+    );
+    // Echo the deleted message's opaque metadata so the caller can release any
+    // resources it referenced (urbancare uncommits media file ids).
+    return { success: true, metadata };
   }
 }

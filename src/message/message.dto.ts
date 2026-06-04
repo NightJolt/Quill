@@ -4,6 +4,7 @@ import {
   IsEnum,
   IsInt,
   IsMongoId,
+  IsObject,
   IsOptional,
   IsString,
   MaxLength,
@@ -50,6 +51,11 @@ export class SendMessageReq {
   @ValidateNested({ each: true })
   @Type(() => AttachmentDto)
   attachments?: AttachmentDto[];
+
+  /** Opaque app-defined JSON (size-capped in the service). */
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -112,6 +118,9 @@ export class MessageRes {
 
   @Type(() => LinkPreviewRes)
   linkPreviews?: LinkPreviewRes[];
+
+  /** Opaque app-defined JSON, echoed back verbatim. */
+  metadata?: Record<string, unknown>;
 
   @IsoDate()
   createdAt!: string;
