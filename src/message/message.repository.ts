@@ -69,4 +69,18 @@ export class MessageRepository {
       .limit(Math.min(limit, 100))
       .exec();
   }
+
+  /**
+   * Single message lookup, scoped by `(appId, roomId)` so a caller can only
+   * reach a message inside the tenant + room it named — a manager moderating
+   * apartment A can't touch a message keyed to apartment B even with its id.
+   */
+  findById(appId: string, roomId: string, id: string): Promise<MessageDocument | null> {
+    return this.messages.findOne({ _id: id, appId, roomId }).exec();
+  }
+
+  /** Persist in-place mutations (edit / soft-delete) made by the service. */
+  save(doc: MessageDocument): Promise<MessageDocument> {
+    return doc.save();
+  }
 }

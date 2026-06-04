@@ -4,6 +4,8 @@ import { MessageRepository } from './message.repository';
 import { MessageDocument } from './message.schema';
 import { ParticipantRepository } from '@/participant/participant.repository';
 import { ApiException, ExcKey } from '@/common/exceptions/api.exception';
+import { RoomBroadcaster } from '@/ws/room-broadcaster.service';
+import { WsEvents } from '@/ws/ws-events';
 import { MessageRes, SendMessageReq } from './message.dto';
 
 @Injectable()
@@ -11,6 +13,7 @@ export class MessageService {
   constructor(
     private readonly repo: MessageRepository,
     private readonly participants: ParticipantRepository,
+    private readonly broadcaster: RoomBroadcaster,
   ) {}
 
   async send(
@@ -28,6 +31,95 @@ export class MessageService {
       attachments: req.attachments,
     });
     return this.toRes(doc);
+  }
+
+  /**
+   * Edit a message's text. Always self-service: even via the trusted internal
+   * key, `actorId` must equal the original sender (managers moderate by
+   * deleting, not editing — see the monolith's `/manager` surface). Broadcasts
+   * `message_update` to the room so live clients reconcile.
+   */
+  async edit(
+    appId: string,
+    roomId: string,
+    messageId: string,
+    actorId: string,
+    content: string,
+  ): Promise<MessageRes> {
+    const doc = await this.loadOrThrow(appId, roomId, messageId);
+    if (doc.deleted) {
+      throw new ApiException(
+        ExcKey.MESSAGE_DELETED,
+        'Cannot edit a deleted message',
+        HttpStatus.CONFLICT,
+      );
+    }
+    if (doc.senderId.toString() !== actorId) {
+      throw new ApiException(
+        ExcKey.FORBIDDEN,
+        'You can only edit your own messages',
+        HttpStatus.FORBIDDEN,
+      );
+    }
+    const trimmed = content.trim();
+    if (!trimmed && !(doc.attachments && doc.attachments.length)) {
+      throw new ApiException(
+        ExcKey.EMPTY_MESSAGE,
+        'Message content cannot be empty — delete it instead',
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+    doc.content = trimmed;
+    doc.editedAt = new Date();
+    await this.repo.save(doc);
+
+    const res = this.toRes(doc);
+    this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_UPDATE, { roomId, message: res });
+    return res;
+  }
+
+  /**
+   * Soft-delete a message (tombstone). `allowAnySender` is the moderation
+   * override the monolith sets on the manager route — when false, the actor
+   * must be the original sender. Clears content/attachments so the deleted text
+   * doesn't linger server-side, then broadcasts `message_deleted`. Idempotent.
+   */
+  async remove(
+    appId: string,
+    roomId: string,
+    messageId: string,
+    actorId: string,
+    allowAnySender: boolean,
+  ): Promise<void> {
+    const doc = await this.loadOrThrow(appId, roomId, messageId);
+    if (doc.deleted) return; // already a tombstone — idempotent
+    if (!allowAnySender && doc.senderId.toString() !== actorId) {
+      throw new ApiException(
+        ExcKey.FORBIDDEN,
+        'You can only delete your own messages',
+        HttpStatus.FORBIDDEN,
+      );
+    }
+    doc.deleted = true;
+    doc.deletedAt = new Date();
+    doc.content = '';
+    doc.attachments = undefined;
+    doc.linkPreviews = undefined;
+    await this.repo.save(doc);
+
+    this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_DELETE, { roomId, messageId });
+  }
+
+  private async loadOrThrow(
+    appId: string,
+    roomId: string,
+    messageId: string,
+  ): Promise<MessageDocument> {
+    const doc = await this.repo.findById(appId, roomId, messageId);
+    if (!doc) {
+      throw new ApiException(ExcKey.MESSAGE_NOT_FOUND, 'Message not found', HttpStatus.NOT_FOUND);
+    }
+    return doc;
   }
 
   /**
@@ -101,6 +193,9 @@ export class MessageService {
       attachments: doc.attachments,
       linkPreviews: doc.linkPreviews,
       createdAt: doc.createdAt,
+      // Omit when absent/false so the wire stays clean for the common case.
+      editedAt: doc.editedAt ? doc.editedAt.toISOString() : undefined,
+      deleted: doc.deleted ? true : undefined,
     });
   }
 }

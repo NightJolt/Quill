@@ -10,13 +10,14 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { AppRegistry } from '../auth/app-registry.service';
+import { AppRegistry } from '@/auth/app-registry.service';
 import { WsSessionGuard, verifyWsHandshake, type WsHandshakeAuth } from '../auth/ws-session.guard';
-import { WsUser } from '../auth/decorators';
-import type { UserContext } from '../auth/app-context';
+import { WsUser } from '@/auth/decorators';
+import type { UserContext } from '@/auth/app-context';
 import { ConnectionRegistry } from './connection-registry.service';
-import { ParticipantService } from '../participant/participant.service';
-import { MessageService } from '../message/message.service';
+import { RoomBroadcaster } from './room-broadcaster.service';
+import { ParticipantService } from '@/participant/participant.service';
+import { MessageService } from '@/message/message.service';
 import {
   MessageEvt,
   ReadEvt,
@@ -50,6 +51,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     private readonly connections: ConnectionRegistry,
     private readonly participants: ParticipantService,
     private readonly messages: MessageService,
+    private readonly broadcaster: RoomBroadcaster,
   ) {}
 
   /**
@@ -59,6 +61,9 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
    * stamps `socket.data` with the verified identity for downstream handlers.
    */
   afterInit(server: Server): void {
+    // Hand the live server to the broadcaster so HTTP `/internal` moderation
+    // (edit/delete) can fan out over the same Socket.IO rooms.
+    this.broadcaster.bind(server);
     server.use((socket: Socket, next) => {
       const result = verifyWsHandshake(this.registry, socket.handshake.auth as WsHandshakeAuth);
       if (!result.ok) {

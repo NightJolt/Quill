@@ -67,7 +67,10 @@ export class Message {
   @Prop({ required: true, type: MongooseSchema.Types.ObjectId })
   senderId!: Types.ObjectId;
 
-  @Prop({ required: true, default: '' })
+  // Not `required` — a soft-deleted tombstone sets this to '', and Mongoose's
+  // required validator rejects empty strings. `default: ''` still guarantees a
+  // string; non-empty content for real sends is enforced in the DTO/service.
+  @Prop({ default: '' })
   content!: string;
 
   @Prop({ type: [AttachmentSchema], default: undefined })
@@ -75,6 +78,21 @@ export class Message {
 
   @Prop({ type: [LinkPreviewSchema], default: undefined })
   linkPreviews?: LinkPreview[];
+
+  /** Set when the sender edits the message; absent on never-edited messages. */
+  @Prop({ type: Date })
+  editedAt?: Date;
+
+  /**
+   * Soft-delete tombstone. When true, `content`/`attachments` are cleared and
+   * clients render a "message deleted" placeholder. History still returns the
+   * row so deleted state is consistent between live and backfilled views.
+   */
+  @Prop({ default: false })
+  deleted!: boolean;
+
+  @Prop({ type: Date })
+  deletedAt?: Date;
 
   createdAt!: Date;
 }

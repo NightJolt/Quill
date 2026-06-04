@@ -97,6 +97,25 @@ export interface MessageEvt {
   clientTempId?: string;
 }
 
+/** Emitted when a message's content changes (edit). Carries the full updated message. */
+export interface MessageUpdateEvt {
+  roomId: string;
+  message: {
+    id: string;
+    senderId: string;
+    content: string;
+    attachments?: SendReq['attachments'];
+    createdAt: string;
+    editedAt?: string;
+  };
+}
+
+/** Emitted when a message is soft-deleted. The client tombstones it by id. */
+export interface MessageDeletedEvt {
+  roomId: string;
+  messageId: string;
+}
+
 export interface TypingEvt {
   roomId: string;
   userId: string;
@@ -120,6 +139,8 @@ export const WsEvents = {
   READ: 'read',
   // outbound
   MESSAGE: 'message',
+  MESSAGE_UPDATE: 'message_update',
+  MESSAGE_DELETE: 'message_deleted',
   TYPING_EVT: 'typing',
   READ_EVT: 'read',
 } as const;
