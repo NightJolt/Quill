@@ -6,7 +6,7 @@ import { ParticipantRepository } from '@/participant/participant.repository';
 import { ApiException, ExcKey } from '@/common/exceptions/api.exception';
 import { RoomBroadcaster } from '@/ws/room-broadcaster.service';
 import { WsEvents } from '@/ws/ws-events';
-import { MessageRes, SendMessageReq } from './message.dto';
+import { LinkPreviewData, MessageRes, SendMessageReq } from './message.dto';
 
 @Injectable()
 export class MessageService {
@@ -110,6 +110,27 @@ export class MessageService {
     this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_DELETE, { roomId, messageId });
   }
 
+  /**
+   * Attach link previews to a message and broadcast the hydrated version
+   * (`message_update`). Called by {@link LinkPreviewService} after an async
+   * fetch. No-op if the message vanished or was deleted in the meantime.
+   */
+  async attachLinkPreviews(
+    appId: string,
+    roomId: string,
+    messageId: string,
+    previews: LinkPreviewData[],
+  ): Promise<void> {
+    if (!previews.length) return;
+    const doc = await this.repo.findById(appId, roomId, messageId);
+    if (!doc || doc.deleted) return;
+    doc.set('linkPreviews', previews); // Mongoose casts plain objects → subdocs
+    await this.repo.save(doc);
+
+    const res = this.toRes(doc);
+    this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_UPDATE, { roomId, message: res });
+  }
+
   private async loadOrThrow(
     appId: string,
     roomId: string,
@@ -186,12 +207,17 @@ export class MessageService {
   }
 
   private toRes(doc: MessageDocument): MessageRes {
+    // `toObject()` strips Mongoose subdocument back-refs (`$parent`, etc.). A
+    // populated `attachments`/`linkPreviews` array left as live subdocs is
+    // circular, which blows the stack when class-transformer (here) or
+    // Socket.IO (on emit) walks it. Plain primitives/ObjectIds are fine as-is.
+    const obj = doc.toObject();
     return plainToInstance(MessageRes, {
       id: doc.id,
       senderId: doc.senderId,
       content: doc.content,
-      attachments: doc.attachments,
-      linkPreviews: doc.linkPreviews,
+      attachments: obj.attachments,
+      linkPreviews: obj.linkPreviews,
       createdAt: doc.createdAt,
       // Omit when absent/false so the wire stays clean for the common case.
       editedAt: doc.editedAt ? doc.editedAt.toISOString() : undefined,

@@ -18,6 +18,7 @@ import { ConnectionRegistry } from './connection-registry.service';
 import { RoomBroadcaster } from './room-broadcaster.service';
 import { ParticipantService } from '@/participant/participant.service';
 import { MessageService } from '@/message/message.service';
+import { LinkPreviewService } from '@/message/link-preview.service';
 import {
   MessageEvt,
   ReadEvt,
@@ -52,6 +53,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     private readonly participants: ParticipantService,
     private readonly messages: MessageService,
     private readonly broadcaster: RoomBroadcaster,
+    private readonly linkPreviews: LinkPreviewService,
   ) {}
 
   /**
@@ -143,6 +145,12 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       clientTempId: body.clientTempId,
     };
     this.server.to(roomChannel(user.appId, body.roomId)).emit(WsEvents.MESSAGE, evt);
+
+    // Fire-and-forget: hydrate a link preview after the message is delivered.
+    // Self-contained (never throws, never blocks the ack); emits its own
+    // `message_update` if a preview is found.
+    void this.linkPreviews.hydrate(user.appId, body.roomId, sent.id, sent.content);
+
     return { messageId: sent.id, createdAt: sent.createdAt };
   }
 

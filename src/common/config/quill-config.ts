@@ -46,4 +46,12 @@ export class QuillConfig {
     return this.config.get<string>('QUILL_ADMIN_TOKEN');
   }
 
+  /**
+   * Kill-switch for server-side link-preview fetching (default on). Set
+   * `QUILL_LINK_PREVIEWS=false` to disable all outbound preview requests — a
+   * prudent valve since the feature fetches user-supplied URLs.
+   */
+  get linkPreviewsEnabled(): boolean {
+    return this.config.get<string>('QUILL_LINK_PREVIEWS', 'true').toLowerCase() !== 'false';
+  }
 }

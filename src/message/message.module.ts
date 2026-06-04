@@ -3,6 +3,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { Message, MessageSchema } from './message.schema';
 import { MessageRepository } from './message.repository';
 import { MessageService } from './message.service';
+import { LinkPreviewService } from './link-preview.service';
 import { MessageController } from './message.controller';
 import { MessageInternalController } from './message-internal.controller';
 import { ParticipantModule } from '../participant/participant.module';
@@ -12,10 +13,10 @@ import { BroadcastModule } from '../ws/broadcast.module';
   imports: [
     MongooseModule.forFeature([{ name: Message.name, schema: MessageSchema }]),
     ParticipantModule, // for ParticipantRepository (isParticipant check)
-    BroadcastModule, // RoomBroadcaster — fan out edit/delete to the room
+    BroadcastModule, // RoomBroadcaster — fan out edit/delete/preview to the room
   ],
   controllers: [MessageController, MessageInternalController],
-  providers: [MessageService, MessageRepository],
-  exports: [MessageService],
+  providers: [MessageService, MessageRepository, LinkPreviewService],
+  exports: [MessageService, LinkPreviewService],
 })
 export class MessageModule {}

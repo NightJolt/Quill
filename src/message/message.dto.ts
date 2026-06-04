@@ -86,6 +86,18 @@ export class LinkPreviewRes {
   siteName?: string;
 }
 
+/**
+ * Plain shape the link-preview scraper produces and `MessageService`
+ * persists. Mongoose casts these into `LinkPreview` subdocuments on save.
+ */
+export interface LinkPreviewData {
+  url: string;
+  title?: string;
+  description?: string;
+  imageUrl?: string;
+  siteName?: string;
+}
+
 // ── Responses ──────────────────────────────────────────────────────────────
 
 export class MessageRes {
