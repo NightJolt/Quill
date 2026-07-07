@@ -27,6 +27,18 @@ export class QuillConfig {
     return uri;
   }
 
+  /**
+   * Database name override. Optional — when unset, mongoose uses the database
+   * from the URI path (or Mongo's default `test`). Useful when the URI is
+   * shared infrastructure (e.g. the urbancare cluster) and Quill should get
+   * its own database without editing the URI.
+   */
+  get dbName(): string | undefined {
+    const raw = this.config.get<string>('QUILL_DB_NAME');
+    const trimmed = raw?.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
   get corsOrigins(): string[] | '*' {
     const raw = this.config.get<string>('QUILL_CORS_ORIGINS', '*');
     if (raw.trim() === '*') return '*';

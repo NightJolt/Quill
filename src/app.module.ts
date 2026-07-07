@@ -14,7 +14,12 @@ import { WsModule } from './ws/ws.module';
   imports: [
     QuillConfigModule,
     MongooseModule.forRootAsync({
-      useFactory: (config: QuillConfig) => ({ uri: config.mongoUri }),
+      // dbName (QUILL_DB_NAME) overrides the database in the URI path when
+      // set; undefined falls back to mongoose's default URI handling.
+      useFactory: (config: QuillConfig) => ({
+        uri: config.mongoUri,
+        dbName: config.dbName,
+      }),
       inject: [QuillConfig],
     }),
     AuthModule,
