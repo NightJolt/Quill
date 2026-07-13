@@ -56,9 +56,11 @@ export class ParticipantRepository {
   }
 
   async markRead(appId: string, roomId: string, userId: string, at: Date): Promise<void> {
+    // $max: the watermark only advances — a stale/out-of-order `read` emit
+    // from a reconnecting client must not regress it.
     await this.participants.updateOne(
       { appId, roomId, userId },
-      { $set: { lastReadAt: at } },
+      { $max: { lastReadAt: at } },
     );
   }
 }

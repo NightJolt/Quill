@@ -339,6 +339,7 @@ WebSocket: wss://quill.example.com/  (Socket.IO endpoint)
 
 REST (implemented today — signature headers X-Quill-App-Id / X-Quill-User-Id / X-Quill-Signature):
   GET    /rooms/{id}/messages?before=|after=&limit=   # history; one direction per call, both exclusive, max 100
+  GET    /rooms/{id}/participants                     # roster + lastReadAt watermarks; participant-gated (read receipts / unread hydration)
 
 REST (sketched, NOT implemented — WS covers these today):
   GET    /rooms                                  # list a user's rooms

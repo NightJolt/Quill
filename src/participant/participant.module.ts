@@ -4,6 +4,7 @@ import { Participant, ParticipantSchema } from './participant.schema';
 import { ParticipantRepository } from './participant.repository';
 import { ParticipantService } from './participant.service';
 import { ParticipantController } from './participant.controller';
+import { ParticipantUserController } from './participant-user.controller';
 import { RoomModule } from '../room/room.module';
 
 @Module({
@@ -11,7 +12,7 @@ import { RoomModule } from '../room/room.module';
     MongooseModule.forFeature([{ name: Participant.name, schema: ParticipantSchema }]),
     RoomModule, // for RoomRepository (assertRoomExists)
   ],
-  controllers: [ParticipantController],
+  controllers: [ParticipantController, ParticipantUserController],
   providers: [ParticipantService, ParticipantRepository],
   exports: [ParticipantService, ParticipantRepository],
 })

@@ -30,6 +30,23 @@ export class ParticipantService {
     return docs.map((d) => this.toRes(d));
   }
 
+  /** Roster for a user-facing caller — only participants may see the roster. */
+  async listForRoomAsUser(
+    appId: string,
+    roomId: string,
+    callerId: string,
+  ): Promise<ParticipantRes[]> {
+    const ok = await this.repo.exists(appId, roomId, callerId);
+    if (!ok) {
+      throw new ApiException(
+        ExcKey.NOT_A_PARTICIPANT,
+        'You are not a participant of this room',
+        HttpStatus.FORBIDDEN,
+      );
+    }
+    return this.listForRoom(appId, roomId);
+  }
+
   isParticipant(appId: string, roomId: string, userId: string): Promise<boolean> {
     return this.repo.exists(appId, roomId, userId);
   }

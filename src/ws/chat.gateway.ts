@@ -168,6 +168,8 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   @UseGuards(WsSessionGuard)
   @SubscribeMessage(WsEvents.READ)
   async onRead(@WsUser() user: UserContext, @MessageBody() body: ReadReq): Promise<void> {
+    const isParticipant = await this.participants.isParticipant(user.appId, body.roomId, user.userId);
+    if (!isParticipant) return;
     // `body.upTo` is already validated as an ISO 8601 string by the global
     // ValidationPipe (see ReadReq's @IsDateString); just parse to Date here.
     const at = new Date(body.upTo);
