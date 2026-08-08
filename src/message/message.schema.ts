@@ -91,6 +91,42 @@ export class Message {
   @Prop({ type: MongooseSchema.Types.Mixed })
   metadata?: Record<string, unknown>;
 
+  /**
+   * Emoji reactions, stored as a **map keyed by the reacting user's id** —
+   * `{ "<userId hex>": "<emoji>" }` — not as an array of `{userId, emoji}`.
+   *
+   * The shape is chosen for atomicity, and it is the whole reason reactions
+   * are not a `metadata` key:
+   *
+   *   - **One reaction per user** is enforced by the data structure itself. A
+   *     map key cannot repeat, so a double-tap (or the same user on two
+   *     devices) can never produce two entries — no dedup logic, no unique
+   *     index, no read-modify-write.
+   *   - **Set / replace / clear are each a single atomic op** on a *distinct
+   *     document path*: `$set {"reactions.<uid>": e}` and
+   *     `$unset {"reactions.<uid>": ""}`. Two users reacting in the same
+   *     instant touch two different paths, so WiredTiger serialises them and
+   *     **both survive** — neither overwrites the other. An array shape would
+   *     have forced either a read-modify-write `save()` (lost updates under a
+   *     reaction burst in an apartment-wide room) or a `$pull`+`$push` pair,
+   *     which Mongo rejects outright as a conflicting update on one path.
+   *
+   * Cost of the shape: map keys are BSON field names, which must be strings —
+   * so this is the one place a user id is *not* stored as an ObjectId (see
+   * "Id storage convention" in CLAUDE.md). Keys are 24-char hex, already
+   * validated by the WS handshake guard, so they are safe as field names
+   * (no `.`, no leading `$`).
+   *
+   * Absent on messages nobody has reacted to (`default: undefined` — no empty
+   * map is written), which is also why no migration is needed: existing rows
+   * read as `undefined`, and `$set` on `reactions.<uid>` creates the path.
+   *
+   * Values are constrained to {@link REACTION_EMOJIS} at the service layer;
+   * the schema only knows they are strings.
+   */
+  @Prop({ type: Map, of: String, default: undefined })
+  reactions?: Map<string, string>;
+
   /** Set when the sender edits the message; absent on never-edited messages. */
   @Prop({ type: Date })
   editedAt?: Date;

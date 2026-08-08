@@ -6,7 +6,15 @@ import { ParticipantRepository } from '@/participant/participant.repository';
 import { ApiException, ExcKey } from '@/common/exceptions/api.exception';
 import { RoomBroadcaster } from '@/ws/room-broadcaster.service';
 import { WsEvents } from '@/ws/ws-events';
-import { LinkPreviewData, MessageRes, SendMessageReq } from './message.dto';
+import type { MessageReactionEvt } from '@/ws/ws-events';
+import { LinkPreviewData, MessageRes, ReactionRes, SendMessageReq } from './message.dto';
+import { REACTION_EMOJIS, canonicalizeReaction, isReactionEmoji } from './reactions';
+
+/** Outcome of a reaction toggle — what the caller now holds, plus the whole message's post-state. */
+export interface ReactResult {
+  emoji: string | null;
+  reactions: ReactionRes[];
+}
 
 @Injectable()
 export class MessageService {
@@ -127,10 +135,99 @@ export class MessageService {
     doc.attachments = undefined;
     doc.linkPreviews = undefined;
     doc.set('metadata', undefined); // drop media/file refs from the tombstone
+    doc.set('reactions', undefined); // a tombstone carries no reactions either
     await this.repo.save(doc);
 
     this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_DELETE, { roomId, messageId });
     return { metadata };
+  }
+
+  /**
+   * Toggle `userId`'s reaction on a message and fan the change out to the room.
+   *
+   * This is Quill's **only user-authenticated message mutation** — everything
+   * else that changes an existing row (edit, delete) is app-private-key gated
+   * on `/internal`, because those carry policy the calling app owns (the
+   * manager delete override). A reaction's only policy is "is a participant of
+   * this room", which Quill already holds, so it is enforced here and reached
+   * straight over the WS session — no monolith hop on a tap-latency gesture.
+   *
+   * Semantics: one reaction per user per message. A *different* emoji replaces
+   * the caller's previous one; the *same* emoji removes it (toggle).
+   *
+   * Authorization, in order:
+   *   1. `assertParticipant` — the caller must be in `roomId`;
+   *   2. the repository predicate pins the message to `(appId, roomId)`, so
+   *      naming a room you *are* in while passing a `messageId` from a room
+   *      you are not in matches nothing and 404s.
+   *
+   * Concurrency: at most two atomic single-path ops, never a read-modify-write.
+   * See {@link MessageRepository.setReaction} for why both are safe under
+   * simultaneous reactions from different users.
+   */
+  async react(
+    appId: string,
+    roomId: string,
+    messageId: string,
+    userId: string,
+    rawEmoji: string,
+  ): Promise<ReactResult> {
+    await this.assertParticipant(appId, roomId, userId);
+
+    const emoji = canonicalizeReaction(rawEmoji);
+    if (!emoji) {
+      throw new ApiException(
+        ExcKey.INVALID_REACTION,
+        'Unsupported reaction emoji',
+        HttpStatus.BAD_REQUEST,
+        { allowed: [...REACTION_EMOJIS] },
+      );
+    }
+
+    // Step 1 — the common case (first reaction, or switching emoji): matches
+    // only when the caller's stored reaction differs from `emoji`.
+    let doc = await this.repo.setReaction(appId, roomId, messageId, userId, emoji);
+    let current: string | null = emoji;
+
+    if (!doc) {
+      // Step 1 missed. Either the caller already holds this exact emoji (the
+      // toggle-off case) or the message isn't reactable — step 2 tells us which.
+      doc = await this.repo.clearReaction(appId, roomId, messageId, userId, emoji);
+      current = null;
+
+      if (!doc) {
+        // Neither predicate matched. Re-read to say *why*, and to close the
+        // one residual race: if this same user changed their reaction from
+        // another connection between step 1 and step 2, both predicates can
+        // legitimately miss while the document is perfectly fine. In that case
+        // we report the state that actually won rather than inventing one.
+        const existing = await this.repo.findById(appId, roomId, messageId);
+        if (!existing) {
+          throw new ApiException(
+            ExcKey.MESSAGE_NOT_FOUND,
+            'Message not found',
+            HttpStatus.NOT_FOUND,
+          );
+        }
+        if (existing.deleted) {
+          throw new ApiException(
+            ExcKey.MESSAGE_DELETED,
+            'Cannot react to a deleted message',
+            HttpStatus.CONFLICT,
+          );
+        }
+        doc = existing;
+        // Same read-side guard the projection uses, so the delta and the
+        // aggregated buckets can never disagree about a retired emoji.
+        const held = existing.reactions?.get(userId);
+        current = isReactionEmoji(held) ? held : null;
+      }
+    }
+
+    const reactions = MessageService.reactionsOf(doc) ?? [];
+    const evt: MessageReactionEvt = { roomId, messageId, userId, emoji: current };
+    this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_REACTION, evt);
+    return { emoji: current, reactions };
   }
 
   /**
@@ -242,10 +339,49 @@ export class MessageService {
       attachments: obj.attachments,
       linkPreviews: obj.linkPreviews,
       metadata: obj.metadata,
+      reactions: MessageService.reactionsOf(doc),
       createdAt: doc.createdAt,
       // Omit when absent/false so the wire stays clean for the common case.
       editedAt: doc.editedAt ? doc.editedAt.toISOString() : undefined,
       deleted: doc.deleted ? true : undefined,
     });
+  }
+
+  /**
+   * Project the per-user storage map onto the aggregated wire shape:
+   * `{ "<uid>": "👍" }` → `[{ emoji: '👍', userIds: ['<uid>'] }]`.
+   *
+   * Returns `undefined` (not `[]`) when nobody has reacted, so the key is
+   * omitted from `MessageRes` entirely — same convention as `editedAt` /
+   * `deleted`, and it keeps history pages lean since most messages carry none.
+   *
+   * Buckets come out in canonical `REACTION_EMOJIS` order and `userIds` are
+   * sorted, so the same state always serialises to the same bytes: chips don't
+   * reshuffle as counts change, and diffing/caching on the client is stable.
+   * Values outside the canonical set are dropped — see `isReactionEmoji`.
+   */
+  private static reactionsOf(doc: MessageDocument): ReactionRes[] | undefined {
+    const stored = doc.reactions;
+    if (!stored) return undefined;
+    // Mongoose hands back a real `Map`, but a `.lean()` read or a plain-object
+    // round trip would give an object — accept both rather than depend on it.
+    const entries: Array<[string, unknown]> =
+      stored instanceof Map
+        ? [...stored.entries()]
+        : Object.entries(stored as Record<string, unknown>);
+
+    const byEmoji = new Map<string, string[]>();
+    for (const [userId, emoji] of entries) {
+      if (!isReactionEmoji(emoji)) continue;
+      const bucket = byEmoji.get(emoji);
+      if (bucket) bucket.push(userId);
+      else byEmoji.set(emoji, [userId]);
+    }
+    if (byEmoji.size === 0) return undefined;
+
+    return REACTION_EMOJIS.filter((emoji) => byEmoji.has(emoji)).map((emoji) => ({
+      emoji,
+      userIds: byEmoji.get(emoji)!.sort(),
+    }));
   }
 }

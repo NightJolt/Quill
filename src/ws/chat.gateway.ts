@@ -19,8 +19,11 @@ import { RoomBroadcaster } from './room-broadcaster.service';
 import { ParticipantService } from '@/participant/participant.service';
 import { MessageService } from '@/message/message.service';
 import { LinkPreviewService } from '@/message/link-preview.service';
+import { ApiException } from '@/common/exceptions/api.exception';
 import {
   MessageEvt,
+  ReactAck,
+  ReactReq,
   ReadEvt,
   ReadReq,
   SendReq,
@@ -176,5 +179,40 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     await this.participants.markRead(user.appId, body.roomId, user.userId, at);
     const evt: ReadEvt = { roomId: body.roomId, userId: user.userId, lastReadAt: at.toISOString() };
     this.server.to(roomChannel(user.appId, body.roomId)).emit(WsEvents.READ_EVT, evt);
+  }
+
+  /**
+   * Toggle the caller's reaction on a message. Unlike edit/delete — which are
+   * app-private-key `/internal` routes because the calling app owns their
+   * policy — a reaction's only policy is room participation, which Quill
+   * enforces itself. So it rides the user's own WS session, no monolith hop.
+   *
+   * The service owns everything (participation check, emoji validation, the
+   * atomic write and the `message_reaction` fan-out, following the edit/delete
+   * precedent where the service broadcasts); this handler is pure wiring plus
+   * the error→ack mapping.
+   *
+   * Errors resolve the ack rather than propagating, mirroring `onSubscribe`.
+   * Rethrowing a non-`ApiException` is deliberate — a genuine bug should hit
+   * Nest's logger, not be laundered into a business-looking `reason`.
+   */
+  @UseGuards(WsSessionGuard)
+  @SubscribeMessage(WsEvents.REACT)
+  async onReact(@WsUser() user: UserContext, @MessageBody() body: ReactReq): Promise<ReactAck> {
+    try {
+      const { emoji, reactions } = await this.messages.react(
+        user.appId,
+        body.roomId,
+        body.messageId,
+        user.userId,
+        body.emoji,
+      );
+      return { ok: true, emoji, reactions };
+    } catch (err) {
+      if (err instanceof ApiException) {
+        return { ok: false, reason: err.key, message: err.message };
+      }
+      throw err;
+    }
   }
 }

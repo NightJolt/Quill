@@ -3,6 +3,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { QuillConfigModule } from './common/config/config.module';
 import { QuillConfig } from './common/config/quill-config';
 import { HealthController } from './common/health.controller';
+import { PublicConfigController } from './common/public-config.controller';
 import { AuthModule } from './auth/auth.module';
 import { AdminModule } from './admin/admin.module';
 import { RoomModule } from './room/room.module';
@@ -29,6 +30,6 @@ import { WsModule } from './ws/ws.module';
     MessageModule,
     WsModule,
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, PublicConfigController],
 })
 export class AppModule {}

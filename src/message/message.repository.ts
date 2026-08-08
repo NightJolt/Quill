@@ -84,4 +84,66 @@ export class MessageRepository {
   save(doc: MessageDocument): Promise<MessageDocument> {
     return doc.save();
   }
+
+  // ── Reactions ────────────────────────────────────────────────────────────
+  //
+  // Both ops are single atomic `findOneAndUpdate`s against one document path
+  // (`reactions.<userId>`), returning the post-image so the service never has
+  // to re-read. Concurrency properties:
+  //
+  //   - Two *different* users hit two different paths → both land, neither is
+  //     lost, no conflict.
+  //   - The *same* user hitting the same path twice is idempotent — a map key
+  //     cannot duplicate.
+  //   - The `deleted: false` + `(appId, roomId)` predicates are part of the
+  //     same atomic match, so a message that is tombstoned or belongs to
+  //     another room/tenant can never be mutated. `null` means "did not
+  //     match"; the service disambiguates why.
+
+  /**
+   * Set the user's reaction to `emoji` — but only if it differs from what they
+   * already have. The `$ne` predicate is what makes toggle-vs-replace decidable
+   * in one round trip without a prior read: a match means "replaced or added"
+   * (the common case, one op); `null` means either "they already hold this
+   * emoji" (→ the caller falls through to {@link clearReaction}) or "the
+   * message isn't reactable". `$ne` also matches a *missing* path, so a
+   * first-ever reaction is the same single op.
+   */
+  setReaction(
+    appId: string,
+    roomId: string,
+    id: string,
+    userId: string,
+    emoji: string,
+  ): Promise<MessageDocument | null> {
+    return this.messages
+      .findOneAndUpdate(
+        { _id: id, appId, roomId, deleted: false, [`reactions.${userId}`]: { $ne: emoji } },
+        { $set: { [`reactions.${userId}`]: emoji } },
+        { new: true },
+      )
+      .exec();
+  }
+
+  /**
+   * Remove the user's reaction — but only if it is still `emoji`. Guarding on
+   * the value keeps the toggle honest: if the user switched to a different
+   * emoji from another device between the two ops, this no-ops rather than
+   * clobbering the newer choice.
+   */
+  clearReaction(
+    appId: string,
+    roomId: string,
+    id: string,
+    userId: string,
+    emoji: string,
+  ): Promise<MessageDocument | null> {
+    return this.messages
+      .findOneAndUpdate(
+        { _id: id, appId, roomId, deleted: false, [`reactions.${userId}`]: emoji },
+        { $unset: { [`reactions.${userId}`]: '' } },
+        { new: true },
+      )
+      .exec();
+  }
 }

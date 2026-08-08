@@ -27,6 +27,8 @@ export const ExcKey = {
   MESSAGE_NOT_FOUND: 'MESSAGE_NOT_FOUND',
   MESSAGE_DELETED: 'MESSAGE_DELETED',
   EMPTY_MESSAGE: 'EMPTY_MESSAGE',
+  /** Reaction emoji outside the canonical set — `data.allowed` carries the set. */
+  INVALID_REACTION: 'INVALID_REACTION',
   INVALID_SIGNATURE: 'INVALID_SIGNATURE',
   UNKNOWN_APP: 'UNKNOWN_APP',
   UNHANDLED: 'UNHANDLED',

@@ -93,6 +93,22 @@ export class LinkPreviewRes {
 }
 
 /**
+ * One reaction bucket: an emoji plus every user currently reacting with it.
+ *
+ * Aggregated from the per-user storage map so clients get a render-ready chip
+ * row (`userIds.length` is the count; `userIds.includes(me)` is the "you
+ * reacted" highlight) without regrouping on every paint. Because one user
+ * holds at most one reaction, a given userId appears in exactly one bucket.
+ *
+ * `userIds` are plain 24-char hex strings — they are Mongo map *keys*, so they
+ * are already strings in storage and need no `@IdField` conversion.
+ */
+export class ReactionRes {
+  emoji!: string;
+  userIds!: string[];
+}
+
+/**
  * Plain shape the link-preview scraper produces and `MessageService`
  * persists. Mongoose casts these into `LinkPreview` subdocuments on save.
  */
@@ -121,6 +137,17 @@ export class MessageRes {
 
   /** Opaque app-defined JSON, echoed back verbatim. */
   metadata?: Record<string, unknown>;
+
+  /**
+   * Emoji reactions, one bucket per emoji, ordered by the canonical
+   * `REACTION_EMOJIS` order (stable — chips never reshuffle as counts change).
+   *
+   * **Omitted entirely when nobody has reacted**, matching how `editedAt` and
+   * `deleted` are omitted — most messages carry none and history pages stay
+   * lean. Clients must read an absent field as `[]`.
+   */
+  @Type(() => ReactionRes)
+  reactions?: ReactionRes[];
 
   @IsoDate()
   createdAt!: string;

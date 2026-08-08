@@ -33,8 +33,8 @@ In:
 
 Out (initially):
 - A built-in admin UI. Apps are managed via raw `/admin/**` HTTP for v1.
-- Voice messages, link previews, emoji picker — these live in **the calling app's frontend**, not in Quill. See "Frontend features" below.
-- Threaded replies, message edit/delete, search. Defer.
+- Voice messages, link previews, **composer** emoji picker — these live in **the calling app's frontend**, not in Quill. See "Frontend features" below. (Message *reactions* are a different thing and are now in — they mutate an existing message, which is server state; see the reversal note in "Skip".)
+- Threaded replies, search. Defer. (Message edit/delete shipped; quote-reply rides the app-owned `metadata` bag and needs no Quill change.)
 - Distributed scaling (Redis adapter, multi-instance). Single instance until proven necessary.
 - Multi-instance cache invalidation. AppRegistry mutations update the local cache directly; for multi-instance deployment, add Mongo change streams on `chat_apps`.
 
@@ -294,11 +294,32 @@ Compound index for room lookups: `(appId, userId)` — for listing a user's room
       siteName?: string,
     }
   ],
-  // v2 fields when needed: replyToId, editedAt, deleted
+  metadata?: Record<string, unknown>,   // opaque, app-owned; Quill never reads it
+  reactions?: { [userId: string]: string },  // emoji reactions — see below
+  editedAt?: Date,
+  deleted: boolean,
+  deletedAt?: Date,
+  // v2 fields when needed: replyToId
 }
 ```
 
-Compound index for history pagination: `(appId, roomId, createdAt)`.
+Compound index for history pagination: `(appId, roomId, createdAt)`. **No index on `reactions`** — see below.
+
+#### Reactions
+
+Stored as a **map keyed by the reacting user's id**, `{ "<userId hex>": "<emoji>" }` — not an array of `{userId, emoji}` pairs. The shape is chosen entirely for concurrency:
+
+- **One reaction per user per message is structural.** A map key cannot repeat, so a double-tap (or the same user on two devices) can never produce two entries. No dedup logic, no unique index, no read-modify-write.
+- **Every mutation is a single atomic op on a distinct document path.** Set/replace is `$set { "reactions.<uid>": emoji }`; remove is `$unset { "reactions.<uid>": "" }`. Two users reacting in the same instant address two *different* paths, so both survive — neither can overwrite the other. An array shape would have forced either a read-modify-write `doc.save()` (lost updates under a reaction burst in an apartment-wide room, which is exactly the load pattern here) or a `$pull`+`$push` pair, which Mongo rejects outright as a conflicting update on one path.
+- **Toggle is decided by the query predicate, not by a prior read.** `setReaction` matches on `"reactions.<uid>": { $ne: emoji }`, so it lands only when the user's reaction actually differs (and `$ne` also matches a *missing* path, so a first-ever reaction is the same single op). A miss means "they already hold this emoji" → `clearReaction` runs with the mirror predicate `"reactions.<uid>": emoji`. Common path is one round trip; toggle-off is two.
+
+Cost of the shape: BSON field names must be strings, so this is the **one documented exception to the "every id-bearing field is stored as an ObjectId" convention** — the keys are 24-char hex strings. They are validated as ObjectId hex by the WS handshake guard before they ever become field names, so they cannot contain `.` or a leading `$`.
+
+Absent on messages nobody has reacted to (`default: undefined` — no empty map is ever written), which is why **no migration is needed**: existing rows read as `undefined`, and `$set` on `reactions.<uid>` creates the path on demand.
+
+**No new index is warranted.** Every reaction touches exactly one document, located by `_id` (plus `appId`/`roomId`/`deleted` as in-document predicates) — the default `_id` index already serves it as a point lookup. There is no query that filters or sorts *by* reaction, and indexing a map field would create a multikey index over a hot, high-churn path for no reader. Revisit only if a "messages I reacted to" query ever appears.
+
+Values are constrained at the service layer to the canonical set in `src/message/reactions.ts` (`👍 ❤️ 😂 😮 😢 🙏`) — the single source of truth, re-exported from `ws/ws-events.ts` for clients to copy and served at runtime from `GET /config`. The read-side projection also drops any stored value outside the set, so the set can be narrowed later without a migration. `MessageService.remove` clears `reactions` alongside `metadata`, so a tombstone carries neither.
 
 ### `chat_apps`
 
@@ -327,6 +348,8 @@ Constraint this places on all Quill apps: **every identifier must be a 24-char h
 
 At the API boundary everything is still strings — DTOs validate via `@IsMongoId()`, path params validate via `ObjectIdPipe`, WS handshake validates `appId` and `userId` as 24-char hex. Service `toRes()` mappers call `.toString()` to convert back. The result: clients always see hex strings, the database always stores ObjectIds.
 
+**One documented exception**: the keys of `chat_messages.reactions` are hex *strings*, because BSON field names cannot be ObjectIds. That is the price of the map shape, and the map shape is what buys atomic per-user updates — see "Reactions" above. The keys are guard-validated as ObjectId hex before they are ever used as field names.
+
 ---
 
 ## API surface
@@ -340,6 +363,13 @@ WebSocket: wss://quill.example.com/  (Socket.IO endpoint)
 REST (implemented today — signature headers X-Quill-App-Id / X-Quill-User-Id / X-Quill-Signature):
   GET    /rooms/{id}/messages?before=|after=&limit=   # history; one direction per call, both exclusive, max 100
   GET    /rooms/{id}/participants                     # roster + lastReadAt watermarks; participant-gated (read receipts / unread hydration)
+
+REST (unauthenticated):
+  GET    /health                                 # liveness probe
+  GET    /config                                 # → { reactions: ["👍","❤️","😂","😮","😢","🙏"] }
+                                                 #   static wire constants both clients must mirror, so
+                                                 #   they cannot drift from server-side validation.
+                                                 #   Nothing tenant-specific belongs here.
 
 REST (sketched, NOT implemented — WS covers these today):
   GET    /rooms                                  # list a user's rooms
@@ -368,30 +398,42 @@ Routes never put `appId` in the URL — it's always derived from the credential.
 ### Client → server
 
 ```
-send         { roomId, content, attachments?, clientTempId } → ack: { messageId, createdAt }
+send         { roomId, content, attachments?, metadata?, clientTempId } → ack: { messageId, createdAt }
 typing       { roomId, isTyping: boolean }
 read         { roomId, upTo: <ISO8601 timestamp> } → updates participant lastReadAt
 subscribe    { roomId } → joins Socket.IO room "room:{appId}:{roomId}", server checks participation
 unsubscribe  { roomId }
+react        { roomId, messageId, emoji } → ack: { ok:true, emoji: string|null, reactions:[...] }
+                                                  | { ok:false, reason, message }
 ```
+
+`react` is the **only user-authenticated message mutation**. Edit and delete go through `/internal` because the calling app owns their policy (the manager delete override); a reaction's only policy is "is a participant of this room", which Quill already enforces — so routing it through the monolith would add a network hop to a tap-latency gesture for no authorization gain.
+
+Toggle semantics, one reaction per user per message (WhatsApp-style): a *different* emoji replaces the caller's previous one, the *same* emoji removes it. There is no separate "unreact" request — the ack's `emoji` (the value, or `null`) says which happened. `emoji` must be in the canonical set or the ack is `{ ok:false, reason:'INVALID_REACTION' }`.
+
+Like `subscribe`, `react` **resolves its ack on failure instead of throwing**. This is load-bearing, not stylistic: Nest does not apply global HTTP exception filters to gateways (`ExceptionFiltersContext.getGlobalMetadata()` returns `[]`), so a thrown `ApiException` reaches `BaseWsExceptionFilter.handleUnknownError`, which flattens it to a generic `{status:'error', message:'Internal server error'}` on the `exception` channel **and never resolves the ack** — the client just times out with no error key. `reason` carries an `ExcKey` so clients share one error map with REST. (`send` still throws and has this problem — see backlog.)
 
 The server validates that the connecting userId is a participant of any room they try to subscribe to. Subscriptions are not persistent — they're per-connection.
 
 ### Server → client
 
 ```
-message         { roomId, message: {...} }
-typing          { roomId, userId, isTyping }
-read            { roomId, userId, lastReadAt }
+message           { roomId, message: {...} }
+message_update    { roomId, message: {...} }        # full message — edit + async link-preview hydration
+message_deleted   { roomId, messageId }
+message_reaction  { roomId, messageId, userId, emoji: string | null }
+typing            { roomId, userId, isTyping }
+read              { roomId, userId, lastReadAt }
 ```
 
-**Implemented today:** `message`, `typing`, `read` (see `ws-events.ts` — the source of truth the frontend copies). The following are **specified but NOT yet emitted** by `chat.gateway.ts` — do not build the frontend against them until they ship:
+**Implemented today:** all of the above (see `ws-events.ts` — the source of truth the frontend copies). The following are **specified but NOT yet emitted** by `chat.gateway.ts` — do not build the frontend against them until they ship:
 
 ```
 participant_add    { roomId, userId }     # NOT IMPLEMENTED — see backlog quill-5
 participant_remove { roomId, userId }     # NOT IMPLEMENTED — see backlog quill-5
-message_update     { roomId, messageId, linkPreviews? | editedAt? }   # NOT IMPLEMENTED — async link-preview / edit hydration, deferred
 ```
+
+`message_reaction` is a **delta, not a snapshot** — deliberately, and it is only safe to be one because the model is one-reaction-per-user: `{userId, emoji}` is a *complete* statement of that user's state on that message, so applying it is idempotent and two different users' events commute in any arrival order. `emoji: null` means the user cleared theirs. A full snapshot would instead be O(participants) bytes on every tap in an apartment-wide room, and two concurrent snapshots could arrive out of order and silently lose a reaction. The aggregated per-emoji buckets live on `MessageRes.reactions` (history + `message_update`), so a client scrolling back sees reaction state without a second round trip.
 
 ### Acks and retries
 
@@ -623,7 +665,25 @@ Findings from a TalkJS-vs-Quill architecture review (2026-05). Tackle gradually 
 
 ### Skip (correct anti-goals; revisit only if a second consuming app demands them)
 
-Per-message `readBy` (TalkJS's own ~≤300-participant cap is the evidence this is the wrong call for apartment-wide rooms), emoji reactions, threaded replies, message edit/delete, message search, presence service. Nothing in the schema paints these into a corner — `replyToId`/`editedAt`/`deleted` are reserved as v2 fields, and presence is derivable from `ConnectionRegistry`.
+Per-message `readBy` (TalkJS's own ~≤300-participant cap is the evidence this is the wrong call for apartment-wide rooms), ~~emoji reactions~~ (**reversed 2026-08 — shipped, see below**), threaded replies, ~~message edit/delete~~ (shipped), message search, presence service. Nothing in the schema paints these into a corner — `replyToId` is still reserved as a v2 field, and presence is derivable from `ConnectionRegistry`.
+
+#### Reversal: emoji reactions are now IN (2026-08)
+
+This entry previously read "emoji reactions" as a correct anti-goal, on the reasoning that emoji belong in the calling app's frontend. **The UrbanCare product owner has explicitly asked for message reactions on both clients (web + Flutter), so the decision is reversed deliberately** — recorded here rather than left as doc-vs-code drift.
+
+Why the original reasoning didn't survive contact:
+
+- The anti-goal conflated two different things. An **emoji picker in the composer** genuinely is frontend-only — emoji are just Unicode inside `content`, and Quill never needs to know. A **reaction** is not: it is a per-user mutation of an *existing* message, which is server state by definition. No amount of frontend work can produce it.
+- It could not be smuggled through `metadata` either. `metadata` is written once at insert and there was, decisively, **no user-authenticated message-mutation path at all** — `edit` and `remove` are both `/internal`, app-private-key gated. Reactions therefore required the first such path (`react` over WS), which is the actual new capability here.
+- The "revisit only if a second consuming app demands them" bar was the wrong bar. It was written for features that add *ongoing* complexity; reactions add one optional schema field, two atomic update ops and one WS event, and cost nothing when unused (absent field → `undefined`, no migration).
+
+What was **kept** from the anti-goals, and is not reversed:
+
+- **No threaded replies. Quill is still not a Slack/Discord.** The reply feature the clients are building is *quote-reply* — a single denormalized reference carried in the app-owned `metadata` bag, fixed at send time, rendered inline above the bubble. That needs **zero** Quill change and is fully compatible with "no threads": there is no sub-conversation, no thread view, no reply count, no `replyToId` on the schema. A real thread view would still need this anti-goal reversed explicitly, and it has not been.
+- **No arbitrary emoji picker for reactions.** The reaction set is a fixed, server-validated six (`👍 ❤️ 😂 😮 😢 🙏`, `src/message/reactions.ts`). That is what keeps the reversal cheap: no picker dependency on either client, no grapheme-safe validation problem server-side (skin-tone modifiers and ZWJ sequences are simply rejected), and a bounded per-message bucket count. Composer emoji stay frontend-only as before.
+- **No per-message `readBy`.** Reactions look superficially similar — a per-user field on a message — but the cardinality argument is different: `readBy` grows to *every* participant on *every* message, whereas reactions are opt-in, rare, and one entry per reacting user. The `lastReadAt` watermark stays.
+
+See "Reactions" under the data model and the WebSocket protocol section for the shipped shape.
 
 ---
 
