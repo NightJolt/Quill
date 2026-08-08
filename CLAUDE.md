@@ -52,11 +52,18 @@ ODM:              @nestjs/mongoose + mongoose 8.x
 Validation:       class-validator + class-transformer
 JWT/signing:      Node's built-in `crypto.createHmac` (no jsonwebtoken needed)
 Config:           @nestjs/config (env-driven)
-Logging:          pino (or Nest's built-in logger)
-Package manager:  pnpm
+Logging:          Nest's built-in `Logger` (pino is NOT a dependency)
+Package manager:  npm (package-lock.json — there is no pnpm lockfile)
 Build:            Nest CLI → dist/
-Deploy:           systemd unit on the urbancare VPS, port 8086, behind nginx with WS upgrade headers
+Deploy:           port 8086. Only a Dockerfile is checked in — no systemd unit,
+                  nginx conf, compose file or CI workflow lives in this repo.
 ```
+
+⚠️ **The Dockerfile does not build.** It runs `corepack enable && pnpm install
+--frozen-lockfile` against `COPY package.json pnpm-lock.yaml* ./`, but the repo
+is npm-managed — the glob matches nothing and pnpm aborts on a missing lockfile
+with that flag. The pnpm lockfile was deliberately removed; the Dockerfile was
+not updated to match. Switch it to `npm ci` before relying on a container build.
 
 **Why not Kotlin + Spring** (matching the monolith): briefly considered. Rejected because (a) Socket.IO is genuinely the best-in-class chat library and rewriting its primitives in raw Spring WS is busy work; (b) TypeScript shares with urbancare_front, so message-event type definitions can be shared between client and server; (c) ~10× lighter idle memory than another Spring app on the same VPS.
 
@@ -93,14 +100,20 @@ class AppRegistry {
 }
 ```
 
-**Required env vars** for the registry to function:
+**Required env vars** — boot crashes if any is missing or malformed:
 
 ```
-QUILL_MASTER_KEY=<64 hex chars>     # 32 random bytes — encrypts every app's key in chat_apps
+MONGO_URI=<connection string>        # QuillConfig.mongoUri throws when unset
+QUILL_MASTER_KEY=<64 hex chars>      # 32 random bytes — encrypts every app's key in chat_apps
 QUILL_ADMIN_TOKEN=<long random hex>  # bearer for /admin endpoints
 ```
 
-Both are required — boot crashes if missing. **There are no `QUILL_APP_*` env vars** — apps are added/removed at runtime via `/admin/**`.
+Optional: `PORT` (8086), `QUILL_DB_NAME` (overrides the DB in the URI),
+`QUILL_CORS_ORIGINS` (default `*`, **HTTP only** — the WS gateway hardcodes
+`origin: '*'` in its decorator, so this does not restrict socket origins),
+`QUILL_LINK_PREVIEWS` (default `true`; `false` disables outbound preview fetches).
+
+Loaded from `.env.local` then `.env`. **There are no `QUILL_APP_*` env vars** — apps are added/removed at runtime via `/admin/**`.
 
 ### Creating, rotating, and revoking apps
 
@@ -583,7 +596,7 @@ src/
 ```
 quill/
 ├── package.json
-├── pnpm-lock.yaml
+├── package-lock.json
 ├── tsconfig.json
 ├── nest-cli.json
 ├── Dockerfile                              # node:22-alpine + dist
