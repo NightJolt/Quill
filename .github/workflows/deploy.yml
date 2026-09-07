@@ -20,7 +20,24 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref_name == 'main' || github.ref_name == 'dev'
     steps:
+      # Deploys also run from the VM's own crontab (ops/watch-deploy.sh), which
+      # needs no secrets. Without this guard the job would fail on every push
+      # until someone adds them, so an unconfigured repo skips quietly instead.
+      # `secrets` cannot be read in an `if:`, hence the output shuffle.
+      - name: Check for deploy credentials
+        id: creds
+        env:
+          HOST: ${{ secrets.HETZNER_HOST }}
+        run: |
+          if [ -n "$HOST" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HETZNER_HOST is not set, skipping. The VM polls origin once a minute and deploys itself (ops/watch-deploy.sh). Add HETZNER_HOST, HETZNER_USER and HETZNER_SSH_KEY to deploy from Actions instead."
+          fi
+
       - name: Deploy ${{ github.ref_name }} to the urbancare VM
+        if: steps.creds.outputs.present == 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.HETZNER_HOST }}
