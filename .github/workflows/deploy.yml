@@ -1,0 +1,42 @@
+# Push to `main` -> rebuilds and restarts the PRODUCTION chat server (:8086, quill.urbancare.ge).
+# Push to `dev`  -> rebuilds and restarts the DEV chat server (:8087).
+#
+# Restarting Quill drops every live Socket.IO session; clients reconnect, but
+# in-flight sends can fail. The dev job stays red until quill-dev.service
+# exists on the VM (see ops/README.md in urbancare-core).
+name: Deploy
+
+on:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.ref_name == 'main' || github.ref_name == 'dev'
+    steps:
+      - name: Deploy ${{ github.ref_name }} to the urbancare VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HETZNER_HOST }}
+          username: ${{ secrets.HETZNER_USER }}
+          key: ${{ secrets.HETZNER_SSH_KEY }}
+          command_timeout: 15m
+          script: |
+            set -euo pipefail
+            BRANCH="${{ github.ref_name }}"
+            if [ "$BRANCH" = main ]; then
+              DIR=~/quill; TARGET=prod
+            else
+              DIR=~/quill-dev; TARGET=dev
+            fi
+            cd "$DIR"
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH" "origin/$BRANCH"
+            git reset --hard "origin/$BRANCH"
+            bash ops/deploy.sh "$TARGET"
