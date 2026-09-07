@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { AppRegistry } from '@/auth/app-registry.service';
 import { ConnectionRegistry } from '@/ws/connection-registry.service';
-import { AppRes, RegisterAppRes, RotateKeyRes } from './admin.dto';
+import { AppRes, PatchAppReq, RegisterAppRes, RotateKeyRes } from './admin.dto';
 
 /**
  * Orchestrates admin-level app lifecycle. Wraps `AppRegistry` mutations
@@ -27,6 +27,15 @@ export class AdminAppService {
 
   async register(label: string): Promise<RegisterAppRes> {
     return plainToInstance(RegisterAppRes, await this.registry.register(label));
+  }
+
+  /**
+   * Update an app's mutable settings. No socket side effects — unlike
+   * `rotate`/`unregister`, changing the callback target doesn't invalidate any
+   * live session's credentials; the next message simply POSTs somewhere else.
+   */
+  async patch(appId: string, req: PatchAppReq): Promise<void> {
+    await this.registry.setCallbackUrl(appId, req.callbackUrl ?? null);
   }
 
   async rotate(appId: string): Promise<RotateKeyRes> {

@@ -47,4 +47,16 @@ export class AppRepository {
       { $set: { encryptedKey, rotatedAt: new Date() } },
     );
   }
+
+  /**
+   * Set or clear the notify callback URL. `null` `$unset`s the field rather
+   * than storing an empty string, so "no callback" reads back as `undefined`
+   * — the same state a never-configured app is in.
+   */
+  async updateCallbackUrl(appId: string, url: string | null): Promise<void> {
+    await this.apps.updateOne(
+      { _id: new Types.ObjectId(appId) },
+      url === null ? { $unset: { callbackUrl: '' } } : { $set: { callbackUrl: url } },
+    );
+  }
 }

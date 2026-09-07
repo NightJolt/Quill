@@ -158,3 +158,38 @@ export class MessageRes {
   /** Present (`true`) only for tombstones; omitted on live messages. */
   deleted?: boolean;
 }
+
+/**
+ * A slice of a room's history centred on one message — the response of
+ * `GET /rooms/{roomId}/messages/around/{messageId}`.
+ *
+ * Used when a client needs to reveal a message it hasn't loaded (tapping a
+ * reply quote whose original is hours further up, or opening chat from a
+ * notification deep link). The client **replaces** its loaded window with
+ * `messages` rather than merging: a merge would splice a disjoint slice next
+ * to the live tail and silently fabricate adjacency between messages that are
+ * far apart in time.
+ *
+ * `messages` is **ascending by `createdAt`** (oldest first) and always
+ * contains `targetId`. The two `hasMore*` flags say whether history continues
+ * past each edge of this window, so the client knows to keep its scroll-up
+ * trigger armed and (when `hasMoreAfter`) that it is detached from the live
+ * tail.
+ */
+export class MessageWindowRes {
+  @Type(() => MessageRes)
+  messages!: MessageRes[];
+
+  /** The anchor message's id — echoed so the client can scroll to it without re-deriving. */
+  @IdField()
+  targetId!: string;
+
+  /** More history exists older than `messages[0]`. */
+  hasMoreBefore!: boolean;
+
+  /**
+   * More history exists newer than the last entry — i.e. this window is
+   * **not** the live tail. Clients mirror this as their "detached" state.
+   */
+  hasMoreAfter!: boolean;
+}

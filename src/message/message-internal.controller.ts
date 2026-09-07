@@ -16,7 +16,7 @@ import type { AppContext } from '@/auth/app-context';
 import { ObjectIdPipe } from '@/common/pipes/object-id.pipe';
 import { MessageService } from './message.service';
 import { EditMessageInternalReq } from './message.dto';
-import type { MessageRes } from './message.dto';
+import type { AttachmentRes, MessageRes } from './message.dto';
 
 /**
  * Trusted moderation surface for messages — Bearer the app's private key, same
@@ -63,16 +63,24 @@ export class MessageInternalController {
     @Param('messageId', ObjectIdPipe) messageId: string,
     @Query('actorId', ObjectIdPipe) actorId: string,
     @Query('allowAnySender', new DefaultValuePipe(false), ParseBoolPipe) allowAnySender: boolean,
-  ): Promise<{ success: true; metadata?: Record<string, unknown> }> {
-    const { metadata } = await this.messages.remove(
+  ): Promise<{
+    success: true;
+    metadata?: Record<string, unknown>;
+    attachments?: AttachmentRes[];
+  }> {
+    const { metadata, attachments } = await this.messages.remove(
       ctx.appId,
       roomId,
       messageId,
       actorId,
       allowAnySender,
     );
-    // Echo the deleted message's opaque metadata so the caller can release any
-    // resources it referenced (urbancare uncommits media file ids).
-    return { success: true, metadata };
+    // Echo the deleted message's opaque metadata *and* its attachments so the
+    // caller can release every resource the message referenced. urbancare
+    // uncommits `metadata.media[].fileId` ∪ `attachments[].fileId` — the
+    // second half is what lets it reclaim voice notes, which ride
+    // `attachments` (`type: 'audio'`) and appear nowhere in `metadata`.
+    // Both are absent on an already-tombstoned message (idempotent re-delete).
+    return { success: true, metadata, attachments };
   }
 }

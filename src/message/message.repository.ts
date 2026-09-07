@@ -80,6 +80,66 @@ export class MessageRepository {
     return this.messages.findOne({ _id: id, appId, roomId }).exec();
   }
 
+  // ── Windowed reads around an anchor message ──────────────────────────────
+  //
+  // These two back `GET /rooms/{id}/messages/around/{messageId}` (jump to a
+  // reply target that isn't in the loaded window). They differ from
+  // {@link findHistory} / {@link findForward} in two deliberate ways:
+  //
+  //   1. **Full `(createdAt, _id)` tuple cursor.** The shipped `before=` /
+  //      `after=` routes cursor on `createdAt` alone, so two messages sharing a
+  //      millisecond can be skipped or repeated at a page boundary. Anchoring
+  //      on a *message* rather than a timestamp lets us close that gap here
+  //      without touching the shipped cursor semantics both clients are built
+  //      on. The `$or` is the standard keyset form: strictly past the anchor's
+  //      timestamp, or level with it and past its `_id`.
+  //   2. **`limit + 1`.** The extra row is the has-more probe — the service
+  //      reports `hasMoreBefore` / `hasMoreAfter` from whether it came back and
+  //      then drops it. `limit` may legitimately be 0 (caller wants only one
+  //      side of the window), and `.limit(0)` means *unlimited* in Mongo, so
+  //      the `+ 1` also keeps that case from fetching the whole room.
+  //
+  // No new index: `{appId: 1, roomId: 1, createdAt: -1}` serves both, with
+  // `_id` only ever tie-breaking within one timestamp.
+
+  /** Messages strictly older than the `(at, id)` anchor, newest-first, `limit + 1` deep. */
+  findBeforeMessage(
+    appId: string,
+    roomId: string,
+    at: Date,
+    id: string,
+    limit: number,
+  ): Promise<MessageDocument[]> {
+    return this.messages
+      .find({
+        appId,
+        roomId,
+        $or: [{ createdAt: { $lt: at } }, { createdAt: at, _id: { $lt: id } }],
+      })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
+      .exec();
+  }
+
+  /** Messages strictly newer than the `(at, id)` anchor, oldest-first, `limit + 1` deep. */
+  findAfterMessage(
+    appId: string,
+    roomId: string,
+    at: Date,
+    id: string,
+    limit: number,
+  ): Promise<MessageDocument[]> {
+    return this.messages
+      .find({
+        appId,
+        roomId,
+        $or: [{ createdAt: { $gt: at } }, { createdAt: at, _id: { $gt: id } }],
+      })
+      .sort({ createdAt: 1, _id: 1 })
+      .limit(limit + 1)
+      .exec();
+  }
+
   /** Persist in-place mutations (edit / soft-delete) made by the service. */
   save(doc: MessageDocument): Promise<MessageDocument> {
     return doc.save();

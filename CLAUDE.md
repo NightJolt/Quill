@@ -121,12 +121,14 @@ All `/admin/**` are guarded by `AdminTokenGuard` (constant-time match against `Q
 
 ```
 POST   /admin/apps               { label }               → { appId, label, privateKey }   (key shown ONCE)
-GET    /admin/apps                                       → [{ appId, label, createdAt, rotatedAt, revoked }]
+GET    /admin/apps                                       → [{ appId, label, createdAt, rotatedAt, revoked, callbackUrl? }]
+PATCH  /admin/apps/:appId        { callbackUrl }         → { success: true }
 POST   /admin/apps/:appId/rotate                         → { privateKey }   (new key, shown ONCE)
 DELETE /admin/apps/:appId                                → { success: true }   (soft delete)
 ```
 
 - `POST /admin/apps` generates a fresh 32-byte privateKey, encrypts it, inserts a `chat_apps` row, updates the cache, returns plaintext. Plaintext is **only** in the response — never retrievable again.
+- `PATCH /admin/apps/:appId` sets the notify callback target (see "Push notifications"). Write-through to Mongo plus a cache patch, so it takes effect on the next message with no restart and no socket disruption. `{"callbackUrl": null}` — or an empty body — clears it, which switches callbacks off. Validated as an absolute `http`/`https` URL of at most 512 chars; `require_tld` is deliberately off so `http://localhost:8085/…` and in-cluster service names are accepted. 404 if the app is unknown or revoked.
 - `POST /admin/apps/:appId/rotate` generates a new key, replaces `encryptedKey`, sets `rotatedAt`, swaps the cache, **disconnects every open Socket.IO connection for this appId**. Clients reconnect with a fresh signature.
 - `DELETE /admin/apps/:appId` sets `revoked: true`, drops the cache entry, disconnects open sockets. Rooms/participants/messages stay; the appId becomes unreachable. Manual hard-delete of the row is fine when you're sure.
 
@@ -342,6 +344,7 @@ Values are constrained at the service layer to the canonical set in `src/message
   label: string (unique),         // 'urbancare' — friendly name for logs/admin
   encryptedKey: string,           // base64(IV || ciphertext || authTag) — AES-256-GCM under QUILL_MASTER_KEY
   rotatedAt?: Date,               // last key rotation
+  callbackUrl?: string,           // notify webhook target; ABSENT = no callbacks (the default off state)
   revoked: boolean,               // soft-delete; revoked apps stop authenticating but rooms stay
   createdAt: Date,
 }
@@ -352,6 +355,8 @@ Values are constrained at the service layer to the canonical set in `src/message
 **Envelope encryption** keeps app secrets out of plaintext DB storage. The master key (`QUILL_MASTER_KEY`) lives only in env; a DB compromise alone yields useless ciphertext. The cost: losing `QUILL_MASTER_KEY` means losing every app key — treat it as a root credential.
 
 **Lifecycle**: `DELETE /admin/apps/:appId` sets `revoked: true` and drops the cache; the row stays for audit. Existing rooms/messages remain in the DB but their appId becomes unreachable for new auth.
+
+`callbackUrl` is cached alongside the key (`AppRegistry.callbackUrlOf`) so `PushService` never hits Mongo on the send path. It is threaded through `applyToCache` by every caller that rewrites an entry — notably `rotate`, which would otherwise silently un-configure the callback on every key rotation.
 
 ### Id storage convention
 
@@ -375,6 +380,8 @@ WebSocket: wss://quill.example.com/  (Socket.IO endpoint)
 
 REST (implemented today — signature headers X-Quill-App-Id / X-Quill-User-Id / X-Quill-Signature):
   GET    /rooms/{id}/messages?before=|after=&limit=   # history; one direction per call, both exclusive, max 100
+  GET    /rooms/{id}/messages/around/{messageId}      # window centred on a message; ?limitBefore=25&limitAfter=25 (counts, max 50 each)
+  GET    /rooms/{id}/messages/{messageId}             # one message, same MessageRes shape as history; 404 if in another room/tenant
   GET    /rooms/{id}/participants                     # roster + lastReadAt watermarks; participant-gated (read receipts / unread hydration)
 
 REST (unauthenticated):
@@ -392,6 +399,29 @@ REST (sketched, NOT implemented — WS covers these today):
 
 Default expectation: **user-facing REST is minimal or zero**. Frontend can do everything over Socket.IO (rooms list, history pagination, send, mark-read). REST is a fallback for cases where WS isn't connected (server-rendered initial state, missed-message backfill).
 
+#### Windowed reads (`/messages/around/{messageId}`, `/messages/{messageId}`)
+
+These exist for one job: **revealing a message the client hasn't loaded** — tapping a reply quote whose original is hours further up, or opening chat from a notification deep link.
+
+```jsonc
+// GET /rooms/{id}/messages/around/{messageId}?limitBefore=25&limitAfter=25
+{
+  "messages": [ /* MessageRes[], ASCENDING by createdAt, always includes the target */ ],
+  "targetId": "68f2…7c",
+  "hasMoreBefore": true,
+  "hasMoreAfter": false
+}
+```
+
+Four things clients must get right:
+
+- **The params are counts, not cursors.** `limitBefore` / `limitAfter` deliberately do *not* reuse the names `before` / `after`, which on the history route mean ISO timestamps. Each defaults to 25 and clamps to 50, so a window is at most 101 rows.
+- **Replace the loaded window wholesale; never merge.** Splicing a disjoint slice next to the live tail fabricates adjacency between messages that are far apart in time.
+- **`hasMoreAfter` is the client's "detached" flag.** While detached, the view is not the live tail: drop incoming `message` events (they are durable server-side and will be read back), page forward with the existing `after=` endpoint, and show a "jump to latest" affordance that clears the state.
+- **404** covers both "no such message" and "exists, but in another room or tenant" — the lookup is pinned to `(appId, roomId)`, so ids from elsewhere are simply invisible.
+
+**These two routes are the only place the `(createdAt, _id)` tie-break is closed.** The shipped `before=` / `after=` cursors key on `createdAt` alone, so messages sharing a millisecond can be skipped or repeated at a page boundary. `findBeforeMessage` / `findAfterMessage` use the full tuple (`$or: [{createdAt: {$lt: at}}, {createdAt: at, _id: {$lt: id}}]`) because they anchor on a *message* rather than a timestamp. The history cursors were left alone on purpose: both shipped clients are built on their current semantics, and changing them buys nothing. Has-more is decided by fetching `limit + 1` and reporting whether the extra row came back, then dropping it. No new index — `{appId: 1, roomId: 1, createdAt: -1}` serves both, with `_id` only tie-breaking inside one timestamp.
+
 ### Internal (private-key auth)
 
 ```
@@ -400,9 +430,21 @@ POST   /internal/rooms/{id}/participants       { userIds: [...] }
 DELETE /internal/rooms/{id}/participants/{userId}
 DELETE /internal/rooms/{id}                    # soft delete
 GET    /internal/rooms/{id}                    # admin read
+PATCH  /internal/rooms/{id}/messages/{mid}     { content, actorId }   # edit (always self-service)
+DELETE /internal/rooms/{id}/messages/{mid}?actorId=&allowAnySender=   # soft delete
 ```
 
 Routes never put `appId` in the URL — it's always derived from the credential.
+
+**The delete response echoes what the tombstone is about to drop**, so the calling app can release the resources the message referenced — Quill holds ids, never bytes:
+
+```json
+{ "success": true,
+  "metadata":    { "media": [ { "fileId": "…", "kind": "image" } ] },
+  "attachments": [ { "type": "audio", "fileId": "…", "mimeType": "audio/mp4", "durationMs": 7400 } ] }
+```
+
+`attachments` matters as much as `metadata`: **voice notes ride `attachments` (`type: 'audio'`) and appear nowhere in `metadata`**, so an app that only reads `metadata.media[].fileId` leaks their files permanently. urbancare uncommits the union of both. Both keys are absent when re-deleting an already-tombstoned message (the op is idempotent and there is nothing left to release).
 
 ---
 
@@ -523,19 +565,45 @@ Today: `ChatDoc(apartmentId)`. After: drop entirely OR repurpose to store the ro
 - Delete `Chat.tsx`, `ChatProvider.tsx`, related files.
 - Build chat UI from scratch — see "Frontend features" below.
 
-### Push notifications
+### Push notifications — the notify callback (BUILT)
 
-Quill emits an internal event to the calling app's backend, which then calls FCM:
+`src/push/push.service.ts`. Quill's **only outbound call to a calling app**. It hands over each sent message; the app decides who (if anyone) gets a notification row and a push. The monolith already owns Firebase Admin / APNs, so Quill stays out of it entirely.
 
 ```
-POST {app_callback_url}/internal/quill/notify
-  Authorization: Bearer <signed by Quill's outbound key per app>
-  Body: { userId, roomId, message: {...} }
+POST {chat_apps.callbackUrl}
+  Content-Type:      application/json
+  X-Quill-App-Id:    <appId hex>
+  X-Quill-Signature: <hex HMAC-SHA256(rawBody, appPrivateKey)>
+
+{ "appId":     "68e0…a1",
+  "roomId":    "69da5643ed2da949bc463b0c",
+  "messageId": "68f2…7c",
+  "senderId":  "68c9…04",
+  "content":   "hey @everyone the water is off",
+  "createdAt": "2026-09-06T11:22:33.444Z",
+  "metadata":  { "mentions": [], "media": [], "replyTo": {} } }
 ```
 
-The monolith owns Firebase Admin SDK already; it handles the actual FCM push. Quill stays focused on chat.
+`metadata` is relayed **verbatim and uninterpreted** — that is the whole point, and it is what keeps Quill ignorant of what a mention means.
 
-**Selection rule**: fan out to message recipients only — skip the sender and skip users with active WS connections. Throttle to one push per (user, room) per 10s to avoid spam.
+**Auth** is `signBody(rawBody, appPrivateKey)` in `src/auth/signature.ts` — the reverse direction of `signUserId`, same per-app secret, no new key material. Body-only signing, no timestamp and no nonce, matching Quill's no-expiry signature philosophy; the payload carries a `messageId` a receiver can dedupe on. Two rules, both easy to get wrong: Quill `JSON.stringify`s **once** and signs and sends that exact string, and **the receiver must verify over the raw request bytes** — parse *after* verifying, never re-serialize and re-sign.
+
+**Where it fires**: `ChatGateway.onSend`, after the room emit, as `void this.push.notify(...)` — never awaited, so it can never touch ack latency. Not in `MessageService.send`, which future REST sends reuse and which owns no broadcast: the callback belongs with the delivery path and must not fire for a send that never reached the room.
+
+**Selection rule — Quill filters nothing.** No recipient selection, no online-skip, no throttle. This supersedes the older sketch above it (which proposed exactly that): Quill *cannot* select correctly, since recipients are a function of `metadata.mentions`, which only the app understands. And skipping a user because one socket happens to be open would silently drop a **durable** notification row for anyone sitting on a stale background tab. Sending everything and letting the app be the policy decision point is the cheaper mistake. `ConnectionRegistry.hasActive` is deliberately not consulted.
+
+**Delivery is best-effort by design**: one attempt with a 5s timeout, one retry after 1s, then a `logger.warn` carrying the `messageId` and it's gone. No queue, no persistence, no backoff ladder. The message itself is already durable in Mongo and readable over history, so a dropped callback costs a notification, never a message. `notify` never throws — it is called un-awaited, where an escaping rejection would become an unhandled promise rejection.
+
+**Off by default.** No `callbackUrl` on the `chat_apps` row means no callback is ever fired. That is the intended off state, not a misconfiguration. Configure it per app:
+
+```bash
+curl -X PATCH http://localhost:8086/admin/apps/$CHAT_APP_ID \
+  -H "Authorization: Bearer $QUILL_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"callbackUrl":"http://localhost:8085/public/chat/quill/notify"}'
+```
+
+The trade being accepted: Quill now makes one outbound HTTP call per chat message. Deliberate — it is the price of keeping the "Quill never interprets metadata" invariant intact, and it is fire-and-forget off the ack path.
 
 ---
 
@@ -621,7 +689,7 @@ quill/
     │   ├── participant.service.ts
     │   └── participant.module.ts
     ├── message/
-    │   ├── message.controller.ts           # GET /rooms/{id}/messages
+    │   ├── message.controller.ts           # GET /rooms/{id}/messages[/{mid}][/around/{mid}]
     │   ├── message.service.ts
     │   ├── message.schema.ts
     │   ├── link-preview.service.ts         # OG scraper with SSRF guards
@@ -630,8 +698,8 @@ quill/
     │   ├── chat.gateway.ts                 # @WebSocketGateway, Socket.IO event handlers
     │   ├── connection-registry.service.ts  # in-memory userId → Set<Socket>
     │   └── ws.module.ts
-    ├── push/
-    │   ├── push.service.ts                 # callback POST to app backend
+    ├── push/                               # BUILT
+    │   ├── push.service.ts                 # signed notify POST to the app's callbackUrl
     │   └── push.module.ts
     └── common/
         ├── exceptions/                     # ApiException + filter
@@ -662,7 +730,7 @@ Findings from a TalkJS-vs-Quill architecture review (2026-05). Tackle gradually 
 ### Soon
 
 - [ ] **Dedup sends on `clientTempId`.** CLAUDE.md tells clients to retry on the 10s ack timeout, but nothing dedups → a write that lands after timeout creates a duplicate broadcast. `clientTempId` is echoed for optimistic UI but never persisted. Make `(appId, roomId, senderId, clientTempId)` an idempotency key: a **partial** unique index (`partialFilterExpression: { clientTempId: { $exists: true } }` — not sparse, and **no TTL** — a Mongo TTL deletes the whole message doc), plumb `clientTempId` through `send()` + `repo.create()`, then catch `isDuplicateKeyError` (helper in `common/utils/mongo-errors.ts`) and re-query to return the original. Sends that omit `clientTempId` are excluded from the index and behave as today.
-- [ ] **Build the `PushService` callback stub + pin reverse-auth** (resolves open-question #2). Fire-and-forget in `ChatGateway.onSend` **after** the broadcast emit (not in `MessageService.send()`, which future REST sends reuse and which owns no broadcast); never block the ack. Recipients = room participants − sender − `ConnectionRegistry.hasActive()`; throttle 1/(appId,userId,roomId)/10s (in-memory Map, single-instance). Contract: `POST {callbackUrl} { userId, roomId, message }` with `X-Quill-Signature = HMAC-SHA256(rawBody, appPrivateKey)` (reuse the user-sig crypto primitive, zero new secrets; monolith verifies over the raw bytes). Add an optional `callbackUrl` to `chat_apps` **and** a `PATCH /admin/apps/:appId { callbackUrl }` to set it (else the field is dead). Decide replay protection explicitly (body-only signing matches Quill's no-expiry philosophy; add a timestamp only if needed — note: the `timestamp + "." + body` scheme is *Stripe's*, not TalkJS's).
+- [x] **Build the `PushService` callback + pin reverse-auth** (resolves open-question #2). **DONE** — see "Push notifications — the notify callback" for the shipped contract. Landed as specified in the placement and auth: fire-and-forget in `ChatGateway.onSend` after the broadcast emit, never awaited; `X-Quill-Signature = HMAC-SHA256(rawBody, appPrivateKey)` via the new `signBody` in `auth/signature.ts` (same primitive as the user signature, zero new secrets, receiver verifies over raw bytes); body-only signing, no timestamp — the payload's `messageId` is the dedupe handle if replay ever matters; `callbackUrl` added to `chat_apps` with `PATCH /admin/apps/:appId` to set it. **Two things were decided the other way**, both deliberately: the payload is `{appId, roomId, messageId, senderId, content, createdAt, metadata}` rather than `{userId, roomId, message}` — there is no single `userId`, because Quill does **no recipient selection**; and there is **no `ConnectionRegistry.hasActive()` filter and no throttle**, because the app is the policy decision point and an online-skip would silently drop a durable notification row for a user with a stale background tab. Retry policy: one attempt (5s), one retry after 1s, then warn and drop.
 - [x] **Reconcile the WS protocol doc with shipped code** *(Done 2026-06.)* `read` now documented as `{roomId, upTo: ISO}` (watermark); reconnect documented as `?after=` (forward) / `?before=` (scroll-up); `participant_add`/`participant_remove`/`message_update` flagged NOT IMPLEMENTED in the Server→client section so the frontend doesn't build against them.
 
 ### Later — cheap internal hardening
@@ -674,7 +742,7 @@ Findings from a TalkJS-vs-Quill architecture review (2026-05). Tackle gradually 
 ### Rejected (considered, declined)
 
 - **Pluggable `verifyCredential` seam for future JWT** — YAGNI. Only two call sites (`signature.guard.ts`, `ws-session.guard.ts`), already adjacent; the client contract lives in the monolith + frontend, which a Quill-internal seam never touches. If JWT is ever needed it's a ~4-line local refactor then. (Non-expiring HMAC is a deliberate, documented choice — see "Signature format".)
-- **Add a per-participant `notify`/mute column now, defer the UI** — on Mongo an optional field with a default applies on read with zero backfill/downtime, so there's no migration cost to pre-empt. Adding it ahead of its only consumer (`PushService`) is a speculative dead field. Add `notify` *in the same change* that builds the push selection rule that reads it.
+- **Add a per-participant `notify`/mute column now, defer the UI** — on Mongo an optional field with a default applies on read with zero backfill/downtime, so there's no migration cost to pre-empt. Adding it ahead of its only consumer (`PushService`) is a speculative dead field. Add `notify` *in the same change* that builds the push selection rule that reads it. **Still rejected now that `PushService` exists**: it performs no selection at all (see "Push notifications"), so a mute column here would have no reader. Mute belongs to whichever app owns the notification policy.
 
 ### Skip (correct anti-goals; revisit only if a second consuming app demands them)
 
@@ -703,7 +771,7 @@ See "Reactions" under the data model and the WebSocket protocol section for the 
 ## Open questions / deferred decisions
 
 1. **Domain**: `chat.urbancare.ge`? Subdomain per app? Single quill domain across apps? Probably single domain (`quill.example.com` or similar) with `appId` differentiating at the auth layer.
-2. **Push callback auth shape**: Quill needs to authenticate itself when calling back into an app's `/internal/quill/notify`. Likely the same per-app key, signed in reverse direction. Define on first push integration.
+2. ~~**Push callback auth shape**~~ — **RESOLVED**. Same per-app key, signed in the reverse direction: `X-Quill-Signature = HMAC-SHA256(rawBody, appPrivateKey)` plus `X-Quill-App-Id`, verified over the raw bytes. See "Push notifications — the notify callback". The target is per-app `chat_apps.callbackUrl`, not a fixed `/internal/quill/notify` path — urbancare mounts it at `POST /public/chat/quill/notify`.
 3. **Migration**: TalkJS message history. Currently on free tier with "Test Mode" banner; assume no migration needed.
 4. **Reconcile job**: nightly cron that walks each app's intended membership (queried via app callback) vs Quill's actual participants and fixes drift. Defer until first drift bug surfaces.
 5. **Rate limits**: per-user message rate cap to mitigate spam/abuse. Defer until needed; trivial to add as a Nest interceptor.

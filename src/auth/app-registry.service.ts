@@ -22,6 +22,13 @@ export class AppRegistry implements OnModuleInit {
   private readonly keyByAppId = new Map<string, string>();
   private readonly appIdByKey = new Map<string, string>();
   private readonly labelByAppId = new Map<string, string>();
+  /**
+   * Notify callback URLs, `appId` → absolute URL. Only apps that actually have
+   * one configured appear here; a miss is the default, intended "no callback"
+   * state, which is why {@link callbackUrlOf} returns `null` rather than
+   * throwing.
+   */
+  private readonly callbackUrlByAppId = new Map<string, string>();
 
   constructor(
     private readonly repo: AppRepository,
@@ -48,6 +55,14 @@ export class AppRegistry implements OnModuleInit {
 
   labelOf(appId: string): string {
     return this.labelByAppId.get(appId) ?? appId;
+  }
+
+  /**
+   * The app's notify callback URL, or `null` when none is configured — the
+   * default state, in which no callback is fired at all.
+   */
+  callbackUrlOf(appId: string): string | null {
+    return this.callbackUrlByAppId.get(appId) ?? null;
   }
 
   // ─── Admin mutations ────────────────────────────────────────────────────
@@ -102,14 +117,51 @@ export class AppRegistry implements OnModuleInit {
     const privateKey = KeyVault.generateAppKey();
     const encryptedKey = this.vault.encrypt(privateKey);
     await this.repo.updateEncryptedKey(appId, encryptedKey);
-    this.applyToCache(appId, doc.label, privateKey);
+    // Carry `callbackUrl` through — `applyToCache` rewrites the whole cache
+    // entry, so omitting it here would silently un-configure the callback on
+    // every key rotation.
+    this.applyToCache(appId, doc.label, privateKey, doc.callbackUrl);
     this.logger.log(`Rotated key for app: ${doc.label}(${appId})`);
     return { privateKey };
   }
 
+  /**
+   * Set (or clear, with `null`) the app's notify callback URL — writes through
+   * to Mongo, then patches the in-memory cache so the change takes effect on
+   * the very next message without a restart.
+   *
+   * Throws `ApiException(404)` if no such app exists or it's already revoked,
+   * matching {@link rotate} / {@link unregister}.
+   */
+  async setCallbackUrl(appId: string, url: string | null): Promise<void> {
+    const doc = await this.repo.findActiveById(appId);
+    if (!doc) {
+      throw new ApiException(
+        ExcKey.UNHANDLED,
+        'App not found or already revoked',
+        HttpStatus.NOT_FOUND,
+      );
+    }
+    await this.repo.updateCallbackUrl(appId, url);
+    if (url) this.callbackUrlByAppId.set(appId, url);
+    else this.callbackUrlByAppId.delete(appId);
+    this.logger.log(
+      url
+        ? `Set callbackUrl for app: ${doc.label}(${appId}) → ${url}`
+        : `Cleared callbackUrl for app: ${doc.label}(${appId})`,
+    );
+  }
+
   /** Non-sensitive snapshot — no keys, suitable for `/admin/apps` list. */
   async list(): Promise<
-    { appId: string; label: string; createdAt: Date; rotatedAt?: Date; revoked: boolean }[]
+    {
+      appId: string;
+      label: string;
+      createdAt: Date;
+      rotatedAt?: Date;
+      revoked: boolean;
+      callbackUrl?: string;
+    }[]
   > {
     const docs = await this.repo.findAll();
     return docs.map((d) => ({
@@ -118,6 +170,9 @@ export class AppRegistry implements OnModuleInit {
       createdAt: d.createdAt,
       rotatedAt: d.rotatedAt,
       revoked: d.revoked,
+      // Not a secret, and the only way to confirm a PATCH landed without
+      // reading Mongo directly.
+      callbackUrl: d.callbackUrl,
     }));
   }
 
@@ -130,6 +185,7 @@ export class AppRegistry implements OnModuleInit {
     this.keyByAppId.clear();
     this.appIdByKey.clear();
     this.labelByAppId.clear();
+    this.callbackUrlByAppId.clear();
     const docs = await this.repo.findActive();
     for (const doc of docs) {
       let plaintextKey: string;
@@ -142,7 +198,7 @@ export class AppRegistry implements OnModuleInit {
         );
         continue;
       }
-      this.applyToCache(doc.id, doc.label, plaintextKey);
+      this.applyToCache(doc.id, doc.label, plaintextKey, doc.callbackUrl);
     }
     const summary = [...this.keyByAppId.keys()]
       .map((id) => `${this.labelByAppId.get(id)}(${id})`)
@@ -152,7 +208,18 @@ export class AppRegistry implements OnModuleInit {
 
   // ─── Cache helpers (private) ────────────────────────────────────────────
 
-  private applyToCache(appId: string, label: string, privateKey: string): void {
+  /**
+   * Write one app's full cache entry. `callbackUrl` is the app's *current*
+   * stored value (undefined when it has none) — every caller must pass what it
+   * read from Mongo, because this rewrites the entry rather than merging into
+   * it. {@link setCallbackUrl} patches that one key on its own instead.
+   */
+  private applyToCache(
+    appId: string,
+    label: string,
+    privateKey: string,
+    callbackUrl?: string,
+  ): void {
     const oldKey = this.keyByAppId.get(appId);
     if (oldKey && oldKey !== privateKey) {
       this.appIdByKey.delete(oldKey);
@@ -160,6 +227,8 @@ export class AppRegistry implements OnModuleInit {
     this.keyByAppId.set(appId, privateKey);
     this.appIdByKey.set(privateKey, appId);
     this.labelByAppId.set(appId, label);
+    if (callbackUrl) this.callbackUrlByAppId.set(appId, callbackUrl);
+    else this.callbackUrlByAppId.delete(appId);
   }
 
   private removeFromCache(appId: string): void {
@@ -167,5 +236,6 @@ export class AppRegistry implements OnModuleInit {
     this.keyByAppId.delete(appId);
     if (key) this.appIdByKey.delete(key);
     this.labelByAppId.delete(appId);
+    this.callbackUrlByAppId.delete(appId);
   }
 }

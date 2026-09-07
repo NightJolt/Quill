@@ -7,7 +7,14 @@ import { ApiException, ExcKey } from '@/common/exceptions/api.exception';
 import { RoomBroadcaster } from '@/ws/room-broadcaster.service';
 import { WsEvents } from '@/ws/ws-events';
 import type { MessageReactionEvt } from '@/ws/ws-events';
-import { LinkPreviewData, MessageRes, ReactionRes, SendMessageReq } from './message.dto';
+import {
+  AttachmentRes,
+  LinkPreviewData,
+  MessageRes,
+  MessageWindowRes,
+  ReactionRes,
+  SendMessageReq,
+} from './message.dto';
 import { REACTION_EMOJIS, canonicalizeReaction, isReactionEmoji } from './reactions';
 
 /** Outcome of a reaction toggle — what the caller now holds, plus the whole message's post-state. */
@@ -107,10 +114,11 @@ export class MessageService {
    * doesn't linger server-side, then broadcasts `message_deleted`. Idempotent.
    */
   /**
-   * Soft-delete a message. Returns the message's `metadata` as it was *before*
-   * tombstoning, so the caller (the app backend) can release any resources it
-   * referenced — e.g. urbancare uncommits the media file ids. Quill itself
-   * never interprets the metadata.
+   * Soft-delete a message. Returns the message's `metadata` **and**
+   * `attachments` as they were *before* tombstoning, so the caller (the app
+   * backend) can release any resources they referenced — urbancare uncommits
+   * `metadata.media[].fileId` ∪ `attachments[].fileId`. Quill itself never
+   * interprets either.
    */
   async remove(
     appId: string,
@@ -118,7 +126,7 @@ export class MessageService {
     messageId: string,
     actorId: string,
     allowAnySender: boolean,
-  ): Promise<{ metadata?: Record<string, unknown> }> {
+  ): Promise<{ metadata?: Record<string, unknown>; attachments?: AttachmentRes[] }> {
     const doc = await this.loadOrThrow(appId, roomId, messageId);
     if (doc.deleted) return {}; // already a tombstone — idempotent, nothing to release
     if (!allowAnySender && doc.senderId.toString() !== actorId) {
@@ -129,6 +137,18 @@ export class MessageService {
       );
     }
     const metadata = doc.metadata; // capture before clearing
+    // `attachments` is captured for the same reason as `metadata`: the caller
+    // owns the file storage those ids point at and can only release them if we
+    // hand them back before the tombstone drops them. Voice notes live here
+    // (`type: 'audio'`) rather than in `metadata.media`, so without this echo
+    // their files would leak permanently.
+    //
+    // Goes through `toObject()` + `plainToInstance` for the same reason
+    // `toRes` does: live Mongoose subdocuments carry circular parent
+    // back-refs, and `AttachmentRes` renders `fileId` as a hex string.
+    const attachments = doc.attachments?.length
+      ? plainToInstance(AttachmentRes, doc.toObject().attachments ?? [])
+      : undefined;
     doc.deleted = true;
     doc.deletedAt = new Date();
     doc.content = '';
@@ -139,7 +159,7 @@ export class MessageService {
     await this.repo.save(doc);
 
     this.broadcaster.emit(appId, roomId, WsEvents.MESSAGE_DELETE, { roomId, messageId });
-    return { metadata };
+    return { metadata, attachments };
   }
 
   /**
@@ -300,6 +320,84 @@ export class MessageService {
     const before = this.parseIso(beforeIso, 'before');
     const docs = await this.repo.findHistory(appId, roomId, before, limit);
     return docs.map((d) => this.toRes(d));
+  }
+
+  /**
+   * One message by id, scoped to `(appId, roomId)`. Backs the "resolve a reply
+   * target I don't have" case where the client only needs the quoted message
+   * itself, not a window around it.
+   *
+   * A message that exists but lives in another room (or another tenant) is a
+   * 404 rather than a 403 — the repository predicate pins it to the room in
+   * the path, so from the caller's position it simply isn't there. That also
+   * keeps the endpoint from confirming the existence of ids outside the room.
+   */
+  async getOne(
+    appId: string,
+    roomId: string,
+    userId: string,
+    messageId: string,
+  ): Promise<MessageRes> {
+    await this.assertParticipant(appId, roomId, userId);
+    const doc = await this.loadOrThrow(appId, roomId, messageId);
+    return this.toRes(doc);
+  }
+
+  /**
+   * A window of history centred on `messageId` — see {@link MessageWindowRes}.
+   *
+   * Returns `[...older, target, ...newer]` ascending, so the client can render
+   * it as one contiguous slice. `limitBefore` / `limitAfter` are **counts**
+   * (unlike the `before=` / `after=` query params on {@link history}, which are
+   * ISO cursors — hence the different names), each clamped to `[0, 50]` for a
+   * hard ceiling of 101 rows.
+   *
+   * Both sides are always queried even when their limit is 0: the repository's
+   * `limit + 1` probe is what decides `hasMoreBefore` / `hasMoreAfter`, and a
+   * caller asking for a one-sided window still needs to know history continues
+   * on the other side.
+   */
+  async getAround(
+    appId: string,
+    roomId: string,
+    userId: string,
+    messageId: string,
+    limitBefore: number,
+    limitAfter: number,
+  ): Promise<MessageWindowRes> {
+    await this.assertParticipant(appId, roomId, userId);
+    const target = await this.loadOrThrow(appId, roomId, messageId);
+
+    const wantBefore = MessageService.clampWindow(limitBefore);
+    const wantAfter = MessageService.clampWindow(limitAfter);
+
+    const [olderDocs, newerDocs] = await Promise.all([
+      this.repo.findBeforeMessage(appId, roomId, target.createdAt, target.id, wantBefore),
+      this.repo.findAfterMessage(appId, roomId, target.createdAt, target.id, wantAfter),
+    ]);
+
+    // The `limit + 1`th row (if any) only signals "there is more" — it is the
+    // probe, never part of the window.
+    const hasMoreBefore = olderDocs.length > wantBefore;
+    const hasMoreAfter = newerDocs.length > wantAfter;
+
+    // `findBeforeMessage` walks backwards (newest-first); flip it so the whole
+    // window comes out ascending.
+    const older = olderDocs.slice(0, wantBefore).reverse();
+    const newer = newerDocs.slice(0, wantAfter);
+
+    return plainToInstance(MessageWindowRes, {
+      messages: [...older, target, ...newer].map((d) => this.toRes(d)),
+      targetId: target.id,
+      hasMoreBefore,
+      hasMoreAfter,
+    });
+  }
+
+  /** Window side count → `[0, 50]`. `ParseIntPipe` has already rejected non-integers. */
+  private static clampWindow(limit: number): number {
+    if (!Number.isFinite(limit)) return 25;
+    return Math.min(50, Math.max(0, Math.trunc(limit)));
   }
 
   private parseIso(iso: string | undefined, field: 'before' | 'after'): Date | undefined {

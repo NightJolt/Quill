@@ -40,6 +40,20 @@ export class App {
   rotatedAt?: Date;
 
   /**
+   * Absolute `http(s)` URL Quill POSTs a notify callback to after every
+   * successfully-sent message in this tenant (see `PushService`). The app
+   * backend turns that into whatever notification/push it wants; Quill relays
+   * the message verbatim and never interprets it.
+   *
+   * **Absent means no callback is ever fired** — that is the intended "off"
+   * state, not a misconfiguration, and it is how every app starts. Set it with
+   * `PATCH /admin/apps/:appId { callbackUrl }`; the same route clears it with
+   * `null`.
+   */
+  @Prop()
+  callbackUrl?: string;
+
+  /**
    * Soft-delete flag. Revoked apps stop authenticating but their rows stay
    * (rooms/messages remain readable for archival). Set true by
    * `DELETE /admin/apps/:appId`.

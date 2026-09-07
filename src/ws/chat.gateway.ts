@@ -19,6 +19,7 @@ import { RoomBroadcaster } from './room-broadcaster.service';
 import { ParticipantService } from '@/participant/participant.service';
 import { MessageService } from '@/message/message.service';
 import { LinkPreviewService } from '@/message/link-preview.service';
+import { PushService } from '@/push/push.service';
 import { ApiException } from '@/common/exceptions/api.exception';
 import {
   MessageEvt,
@@ -57,6 +58,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     private readonly messages: MessageService,
     private readonly broadcaster: RoomBroadcaster,
     private readonly linkPreviews: LinkPreviewService,
+    private readonly push: PushService,
   ) {}
 
   /**
@@ -155,6 +157,15 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     // Self-contained (never throws, never blocks the ack); emits its own
     // `message_update` if a preview is found.
     void this.linkPreviews.hydrate(user.appId, body.roomId, sent.id, sent.content);
+
+    // Fire-and-forget: hand the message to the app backend so it can raise
+    // notifications/pushes. Same contract as the link preview above — never
+    // awaited, never throws, no-ops entirely when the app has no `callbackUrl`
+    // configured. It lives here rather than in `MessageService.send` because
+    // the callback belongs with the delivery path (it must not fire for a send
+    // that never reached the room), and it comes *after* the emit so live
+    // clients are never waiting behind an outbound HTTP call.
+    void this.push.notify(user.appId, body.roomId, sent);
 
     return { messageId: sent.id, createdAt: sent.createdAt };
   }
