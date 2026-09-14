@@ -148,5 +148,8 @@ export class Message {
 export type MessageDocument = HydratedDocument<Message>;
 export const MessageSchema = SchemaFactory.createForClass(Message);
 
-// History pagination scan: same room, walk backwards in time.
-MessageSchema.index({ appId: 1, roomId: 1, createdAt: -1 });
+// History pagination scan: same room, walk backwards in time. `_id` is the
+// trailing key so the windowed `messages/around` reads — which sort on
+// `{createdAt: -1, _id: -1}` — are index-satisfiable: without it Mongo adds a
+// blocking SORT over every message in the room on each jump.
+MessageSchema.index({ appId: 1, roomId: 1, createdAt: -1, _id: -1 });

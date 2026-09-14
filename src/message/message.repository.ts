@@ -99,8 +99,9 @@ export class MessageRepository {
   //      side of the window), and `.limit(0)` means *unlimited* in Mongo, so
   //      the `+ 1` also keeps that case from fetching the whole room.
   //
-  // No new index: `{appId: 1, roomId: 1, createdAt: -1}` serves both, with
-  // `_id` only ever tie-breaking within one timestamp.
+  // Served by `{appId: 1, roomId: 1, createdAt: -1, _id: -1}` — the trailing
+  // `_id` is what lets the `(createdAt, _id)` sort walk the index instead of
+  // materialising and sorting the whole room on every jump.
 
   /** Messages strictly older than the `(at, id)` anchor, newest-first, `limit + 1` deep. */
   findBeforeMessage(
