@@ -1,4 +1,4 @@
-# Push to `main` -> rebuilds and restarts the PRODUCTION chat server (:8086, quill.urbancare.ge).
+# Push to `prod` -> rebuilds and restarts the PRODUCTION chat server (:8086, quill.urbancare.ge).
 # Push to `dev`  -> rebuilds and restarts the DEV chat server (:8087).
 #
 # Restarting Quill drops every live Socket.IO session; clients reconnect, but
@@ -8,7 +8,7 @@ name: Deploy
 
 on:
   push:
-    branches: [main, dev]
+    branches: [prod, dev]
   workflow_dispatch:
 
 concurrency:
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    if: github.ref_name == 'main' || github.ref_name == 'dev'
+    if: github.ref_name == 'prod' || github.ref_name == 'dev'
     steps:
       # Deploys also run from the VM's own crontab (ops/watch-deploy.sh), which
       # needs no secrets. Without this guard the job would fail on every push
@@ -47,7 +47,7 @@ jobs:
           script: |
             set -euo pipefail
             BRANCH="${{ github.ref_name }}"
-            if [ "$BRANCH" = main ]; then
+            if [ "$BRANCH" = prod ]; then
               DIR=~/quill; TARGET=prod
             else
               DIR=~/quill-dev; TARGET=dev
